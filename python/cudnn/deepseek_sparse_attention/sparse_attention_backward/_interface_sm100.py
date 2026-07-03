@@ -153,45 +153,47 @@ def flash_attn_bwd_sm100(
             block_tile=block_tile,
         )
 
-        flash_attn_bwd_sm100.compile_cache[compile_key] = cute.compile(
-            kernel_obj,
+        with torch.cuda.nvtx.range("flash_attn_bwd_sm100_compile"):
+            flash_attn_bwd_sm100.compile_cache[compile_key] = cute.compile(
+                kernel_obj,
+                problem_shape,
+                q_tensor,
+                kv_tensor,
+                out_tensor,
+                dout_tensor,
+                lse_tensor,
+                attn_sink_tensor,
+                topk_idxs_tensor,
+                topk_length_tensor,
+                dq_tensor,
+                dkv_tensor,
+                d_sink_tensor,
+                workspace_LSE_OdO_tensor,
+                workspace_dKV_tensor,
+                softmax_scale,
+                current_stream,
+                options=compile_options(),
+            )
+
+    with torch.cuda.nvtx.range("flash_attn_bwd_sm100_kernel"):
+        flash_attn_bwd_sm100.compile_cache[compile_key](
             problem_shape,
-            q_tensor,
-            kv_tensor,
-            out_tensor,
-            dout_tensor,
-            lse_tensor,
-            attn_sink_tensor,
-            topk_idxs_tensor,
-            topk_length_tensor,
-            dq_tensor,
-            dkv_tensor,
-            d_sink_tensor,
-            workspace_LSE_OdO_tensor,
-            workspace_dKV_tensor,
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            topk_length,
+            dq,
+            dkv,
+            d_sink,
+            workspace_LSE_OdO,
+            workspace_dKV,
             softmax_scale,
             current_stream,
-            options=compile_options(),
         )
-
-    flash_attn_bwd_sm100.compile_cache[compile_key](
-        problem_shape,
-        q,
-        kv,
-        out,
-        dout,
-        lse,
-        attn_sink,
-        topk_idxs,
-        topk_length,
-        dq,
-        dkv,
-        d_sink,
-        workspace_LSE_OdO,
-        workspace_dKV,
-        softmax_scale,
-        current_stream,
-    )
 
     return dq, dkv, d_sink
 
