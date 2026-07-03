@@ -704,7 +704,6 @@ def cute_dsl_topk_wrapper(
             buffer_numbers,
             num_cols,
             dtype=torch.int32,
-            device="cuda",
         )
         # TVM FFI uses env stream automatically
         compiled_kernel(
@@ -739,7 +738,6 @@ def cute_dsl_topk_wrapper(
             buffer_numbers,
             num_cols,
             dtype=torch.int32,
-            device="cuda",
         )
         compiled_kernel(
             input_values[row_lo:row_hi],
