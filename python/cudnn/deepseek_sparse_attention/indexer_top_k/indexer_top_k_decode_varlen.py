@@ -682,9 +682,14 @@ def cute_dsl_topk_wrapper(
     else:
         compiled_kernel = _compile_cache[key]
 
-    output_indices_torch = torch.empty(num_rows, top_k, dtype=torch.int32)
+    output_place = input_values.place
+    output_indices_torch = torch.empty(
+        num_rows, top_k, dtype=torch.int32, device=output_place
+    )
     if return_val:
-        output_values_torch = torch.empty(num_rows, top_k, dtype=torch_dtype)
+        output_values_torch = torch.empty(
+            num_rows, top_k, dtype=torch_dtype, device=output_place
+        )
     else:
         output_values_torch = None
 
@@ -704,6 +709,7 @@ def cute_dsl_topk_wrapper(
             buffer_numbers,
             num_cols,
             dtype=torch.int32,
+            device=output_place,
         )
         # TVM FFI uses env stream automatically
         compiled_kernel(
@@ -738,6 +744,7 @@ def cute_dsl_topk_wrapper(
             buffer_numbers,
             num_cols,
             dtype=torch.int32,
+            device=output_place,
         )
         compiled_kernel(
             input_values[row_lo:row_hi],
