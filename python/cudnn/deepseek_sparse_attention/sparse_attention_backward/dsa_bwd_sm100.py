@@ -1774,7 +1774,14 @@ class FlashAttentionDSABackwardSm100:
                     (softmax_scale_log2_e, softmax_scale_log2_e),
                     lse,
                 )
-
+                # [HOTFIX exp2-clamp] correct softmax prob P<=1 => exp2 arg <=0
+                # always. Clamp min(x,0) = -fmax(-x,0) (no fmin intrinsic). This
+                # is a NO-OP on all legit values and only caps the impossible
+                # positive artifact (degenerate row + logit spike) that would
+                # overflow exp2 to +inf and yield NaN in dS=P*(dP-D).
+                tTR_rS[i] = -cute.arch.fmax(-tTR_rS[i], Float32(0.0))
+                tTR_rS[i + 1] = -cute.arch.fmax(-tTR_rS[i + 1], Float32(0.0))
+                
                 tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
                 tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
 
