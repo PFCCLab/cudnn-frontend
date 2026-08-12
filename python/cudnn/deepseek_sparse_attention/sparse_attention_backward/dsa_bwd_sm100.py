@@ -1554,6 +1554,35 @@ class FlashAttentionDSABackwardSm100:
                     kv_fast = Int32(1)
                     kv_first = first
 
+            # Fast-path vote: the check depends only on the topk
+            # indices, not on the sK buffer, so it runs before
+            # producer_acquire -- the TMA can be issued the moment MMA
+            # releases the K stage.
+            kv_fast = Int32(0)
+            kv_first = Int32(0)
+            if cutlass.const_expr(mTopkLength is not None):
+                cand_first = rTopkIdx[0] - local_warp_idx
+                vote = cand_first
+                for i in cutlass.range_constexpr(1, rows_per_warp):
+                    if rTopkIdx[i] - rTopkIdx[0] != i * self.num_load_KV_warps:
+                        vote = Int32(-1)
+                # The vote barrier limits warp skew to one iteration. Alternate
+                # slots so the next iteration cannot overwrite votes still read
+                # by a lagging warp from the current iteration.
+                vote_base = (tile_index & 1) * self.num_load_KV_warps
+                if tidx % self.threads_per_warp == 0:
+                    kv_vote[vote_base + local_warp_idx] = vote
+                self.load_KV_sync_barrier.arrive_and_wait()
+                first = kv_vote[vote_base]
+                if (
+                    first >= 0
+                    and kv_vote[vote_base + 1] == first
+                    and kv_vote[vote_base + 2] == first
+                    and kv_vote[vote_base + 3] == first
+                ):
+                    kv_fast = Int32(1)
+                    kv_first = first
+
             load_mma_K_pipeline.producer_acquire(load_mma_K_producer_state)
             sK_slice = sK[(None, None), 0, (None, None), load_mma_K_producer_state.index]
             sK_slice = cute.composition(sK_slice, cute.make_layout((self.block_tile, self.head_dim)))
@@ -2072,7 +2101,6 @@ class FlashAttentionDSABackwardSm100:
                 # overflow exp2 to +inf and yield NaN in dS=P*(dP-D).
                 tTR_rS[i] = -cute.arch.fmax(-tTR_rS[i], Float32(0.0))
                 tTR_rS[i + 1] = -cute.arch.fmax(-tTR_rS[i + 1], Float32(0.0))
-
                 tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
                 tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
 

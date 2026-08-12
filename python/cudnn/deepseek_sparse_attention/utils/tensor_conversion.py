@@ -15,6 +15,7 @@ def get_broadcast_dims(tensor: torch.Tensor) -> tuple[bool, ...]:
     return tuple(stride == 0 for stride in tensor.stride())
 
 
+
 def _dim_order(t):
     if hasattr(t, "dim_order"):
         return t.dim_order()
