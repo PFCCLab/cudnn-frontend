@@ -1297,12 +1297,19 @@ class FlashAttentionDSABackwardSm100:
 
             if cutlass.const_expr(mTopkLength is not None):
                 if cutlass.const_expr(is_first):
-                    if idx < topk:
+                    if idx < topk and topk_idx >= 0:
                         self._copy_kv_row(mKV, topk_idx, batch_idx, tile_sK, local_tidx, async_copy_atom, async_thr_copy)
                     else:
                         self._zero_kv_row(tile_sK, local_tidx)
                 else:
-                    self._copy_kv_row(mKV, topk_idx, batch_idx, tile_sK, local_tidx, async_copy_atom, async_thr_copy)
+                    # topk_length only bounds the loop; -1 entries (interior holes)
+                    # can still appear inside [0, topk_length). Gathering KV row -1
+                    # is an OOB read -> garbage/NaN into the dQ GEMM. Zero the hole
+                    # row instead (its topk_prob is 0, so it contributes nothing).
+                    if topk_idx >= 0:
+                        self._copy_kv_row(mKV, topk_idx, batch_idx, tile_sK, local_tidx, async_copy_atom, async_thr_copy)
+                    else:
+                        self._zero_kv_row(tile_sK, local_tidx)
             else:
                 if idx < topk:
                     if topk_idx >= 0:
