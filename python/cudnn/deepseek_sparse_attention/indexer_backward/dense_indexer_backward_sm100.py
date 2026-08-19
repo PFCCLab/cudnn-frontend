@@ -431,6 +431,12 @@ class DenseIndexerBackward2QGemmSm100:
             barrier_id=4,
             num_threads=self.WARP_SIZE + 2 * self.WARPGROUP_SIZE,
         )
+        # Reduce warpgroup (warps 8-11) only.  ids 0/3/4 are taken by
+        # sync_threads, compute_sync_barrier and tmem_alloc_barrier.
+        self.dk_reduce_barrier = pipeline.NamedBarrier(
+            barrier_id=5,
+            num_threads=self.WARPGROUP_SIZE,
+        )
 
     @cute.jit
     def __call__(
@@ -1883,9 +1889,14 @@ class DenseIndexerBackward2QGemmSm100:
             # 3. Signal DK_EMPTY immediately after T2R (single-buffered)
             cute.arch.mbarrier_arrive(mbar + MBAR_2Q_DK_EMPTY)
 
-            # 4. Wait for previous bulk reduce to finish, then signal TMA engine is free
+            # 4. Wait for previous bulk reduce to finish before ANY lane
+            # overwrites the single-buffered staging tile.  cp.async.bulk groups
+            # are per-thread, so only the issuing thread's wait is meaningful —
+            # the barrier is what extends it to the other 127 lanes.
             if bi > 0:
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                if wg_tidx == 0:
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                self.dk_reduce_barrier.arrive_and_wait()
 
             # 5. Scatter-write: registers → sdK_reduce
             for pair in cutlass.range(cute.size(tDKrDK) // 2, unroll_full=True):
@@ -1897,7 +1908,16 @@ class DenseIndexerBackward2QGemmSm100:
                     sdK_reduce[n, d] = tDKrDK[ei] * Float32(sm_scale)
                     sdK_reduce[n, d + 1] = tDKrDK[ei + 1] * Float32(sm_scale)
 
+            # All 128 lanes write disjoint [n, d] slots, but the bulk DMA below
+            # is issued by ONE thread and reads the whole tile.  fence_proxy is
+            # a proxy fence: it only orders the *executing* thread's prior
+            # generic-proxy SMEM writes against the async proxy, and neither
+            # waits for nor publishes any other lane's stores.  A real
+            # warpgroup barrier is required on both sides of it — same pattern
+            # as the dQ epilogue's compute_sync_barrier above.
+            self.dk_reduce_barrier.arrive_and_wait()
             cute.arch.fence_proxy("async.shared", space="cta")
+            self.dk_reduce_barrier.arrive_and_wait()
 
             # 6. Single-thread bulk reduce DMA — only ONE thread in the
             # reduce warpgroup must issue cp.async.bulk; otherwise each

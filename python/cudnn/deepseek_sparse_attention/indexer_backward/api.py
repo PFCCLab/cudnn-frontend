@@ -341,6 +341,20 @@ class DenseIndexerBackward(APIBase):
         self._value_error_if(self.block_I <= 0, f"block_I must be positive, got {self.block_I}")
         self._value_error_if(self.ratio < 1, f"ratio must be >= 1, got {self.ratio}")
         self._value_error_if(self.heads < 64, f"DenseIndexerBackward requires heads >= 64, got {self.heads}")
+        # The dK epilogue stages a (block_I, head_dim_padded) FP32 tile in SMEM and
+        # ships it with one cp.reduce.async.bulk of
+        # ``actual_rows * head_dim_padded * 4`` bytes, which silently assumes the
+        # global dK row stride equals head_dim_padded.  On top of that the TMEM
+        # load atom (Ld16x256b, Repetition(8)) only tiles the staging buffer
+        # completely at the widths it was tuned for.  Measured on SM100-class
+        # hardware: head_dim 64 and 128 are correct, 96 / 100 / 112 return
+        # silently wrong d_index_k (relative error up to 4e2, and head_dim=100
+        # also corrupts d_index_q with NaN / 1e38), and 192 / 256 abort with
+        # cudaErrorInvalidValue.  Reject instead of returning bad gradients.
+        self._value_error_if(
+            self.head_dim not in (64, 128),
+            f"DenseIndexerBackward supports head_dim 64 or 128, got {self.head_dim}",
+        )
         self._is_supported = True
         return True
 

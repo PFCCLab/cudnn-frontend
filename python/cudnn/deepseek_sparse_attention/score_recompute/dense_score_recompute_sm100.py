@@ -68,6 +68,25 @@ mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
 add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd="rn")
 fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd="rn")
 
+# exp2 argument bounds for the attention score epilogue.
+#
+# EXP2_ARG_MIN: below this exp2 lands in the denormal range; clamping keeps the
+# FMA pipeline out of the slow path (the pre-existing qhpkv != 64 branch already
+# did this).
+#
+# EXP2_ARG_MAX: exp2 overflows fp32 at 128, and the epilogue then sums up to
+# `qhpkv` terms, so each term must stay below FLT_MAX / qhpkv.  2**120 * 64 =
+# 8.5e37 < 3.4e38, so 120 keeps the head sum finite for every supported head
+# count.  Without this an `lse` that is finite but far too small -- e.g. the
+# additive -1e30 mask constant a caller's own LSE pass may leave on a row whose
+# candidate set degenerated -- produces out = +inf AND denom = +inf, and the
+# consumer's `score / denom` becomes a silent NaN.  Clamping turns that into a
+# large finite value, which is detectable instead of poisoning the gradient.
+# Note this bounds each term, not the column sum: a row-level overflow of the
+# L1 norm is still possible and is not something an exponent clamp can prevent.
+EXP2_ARG_MIN = -126.0
+EXP2_ARG_MAX = 120.0
+
 
 class DenseScoreRecomputeSm100:
     """
@@ -1373,11 +1392,18 @@ class DenseScoreRecomputeSm100:
                             lse_pair,
                         )
                         if cutlass.const_expr(qhpkv == 64):
+                            # Upper clamp only: the head count is exactly 64
+                            # here, so this is the production hot path and the
+                            # denormal guard is not worth a second predicate.
+                            val0 = val0 if val0 < Float32(EXP2_ARG_MAX) else Float32(EXP2_ARG_MAX)
+                            val1 = val1 if val1 < Float32(EXP2_ARG_MAX) else Float32(EXP2_ARG_MAX)
                             val0 = cute.math.exp2(val0, fastmath=True)
                             val1 = cute.math.exp2(val1, fastmath=True)
                         else:
-                            val0 = val0 if val0 > Float32(-126.0) else Float32(-126.0)
-                            val1 = val1 if val1 > Float32(-126.0) else Float32(-126.0)
+                            val0 = val0 if val0 > Float32(EXP2_ARG_MIN) else Float32(EXP2_ARG_MIN)
+                            val1 = val1 if val1 > Float32(EXP2_ARG_MIN) else Float32(EXP2_ARG_MIN)
+                            val0 = val0 if val0 < Float32(EXP2_ARG_MAX) else Float32(EXP2_ARG_MAX)
+                            val1 = val1 if val1 < Float32(EXP2_ARG_MAX) else Float32(EXP2_ARG_MAX)
                             val0 = cute.math.exp2(val0, fastmath=True)
                             val1 = cute.math.exp2(val1, fastmath=True)
 
