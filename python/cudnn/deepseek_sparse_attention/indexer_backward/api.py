@@ -37,7 +37,7 @@ def _validate_grad_loss_tensor(grad_loss: torch.Tensor, device: torch.device) ->
         raise TypeError("grad_loss must be a torch.Tensor")
     if grad_loss.numel() != 1 or grad_loss.dtype != torch.float32 or grad_loss.device != device:
         raise ValueError(f"grad_loss must be a single-element float32 tensor on {device}")
-    return grad_loss.detach().view(1)
+    return grad_loss.detach().reshape([1])
 
 
 def _contiguous_input(tensor: torch.Tensor) -> torch.Tensor:
