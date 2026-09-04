@@ -16,17 +16,17 @@ from fe_api.dsa.dsa_reference import (
 )
 
 
-def _require_exact_sm100():
-    """Skip unless the current device is exactly SM100 (capability ``(10, 0)``).
+def _require_sm100_family():
+    """Skip unless the current device is SM100-family (capability major 10).
 
     ``dsa_init(min_compute_capability=100)`` means "SM100 **or newer**" — it
-    compares ``major * 10 + minor`` — so an SM103/SM107/SM120 runner falls
-    straight through it. ``backend="sm100_v2"`` is exact-``(10, 0)`` by
-    construction (``check_support`` raises otherwise), so the v2 tests need
-    the exact gate on top of ``dsa_init``'s floor.
+    compares ``major * 10 + minor`` — so an SM120 runner falls straight through
+    it. ``backend="sm100_v2"`` is major-10 by construction (``check_support``
+    raises otherwise), so the v2 tests need the family gate on top of
+    ``dsa_init``'s floor.
     """
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("backend='sm100_v2' requires an SM100 (10, 0) GPU")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("backend='sm100_v2' requires an SM100-family (major 10) GPU")
 
 
 def _allocate(cfg, sm_scale: float):
@@ -681,8 +681,8 @@ def test_DSA_indexer_backward_wrapper_v2(
     request,
 ):
     """``backend="sm100_v2"`` keeps the wrapper contract with two-term
-    bf16-expansion GEMMs and a deterministic d_weights reduction. Exactly
-    SM100 (``_require_exact_sm100``); every parametrized config here is inside
+    bf16-expansion GEMMs and a deterministic d_weights reduction. SM100-family
+    only (``_require_sm100_family``); every parametrized config here is inside
     the declared support envelope, so any error past the gate is a real failure
     and MUST fail -- no skip conversion. topk coverage: 128 = the 1-tile floor
     (odd-tile dK drain, K/S pipes clamped to 1); 256 = 2 tiles (paired dK
@@ -698,7 +698,7 @@ def test_DSA_indexer_backward_wrapper_v2(
         from cuda.bindings import driver as cuda  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -823,7 +823,7 @@ def test_DSA_indexer_backward_wrapper_v2_low_tile_metadata_war(
         from cudnn import DSA  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -902,7 +902,7 @@ def test_DSA_indexer_backward_wrapper_v2_full_valid_topk2048(
         from cudnn import DSA  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -984,7 +984,7 @@ def test_DSA_indexer_backward_wrapper_v2_envelope_rejection(
         from cuda.bindings import driver as cuda  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     topk = {"topk_2176": 2176, "topk_not_mult_128": 1000}.get(bad, 512)
     cfg = dsa_init(
@@ -1083,7 +1083,7 @@ def test_DSA_indexer_backward_wrapper_v2_batch_local_global_oob(
         from cudnn import DSA  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -1186,7 +1186,7 @@ def test_DSA_indexer_backward_wrapper_v2_sm_scale(
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -1285,7 +1285,7 @@ def test_DSA_indexer_backward_wrapper_v2_fp32_outputs(
         from cudnn import DSA  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -1355,7 +1355,7 @@ def test_DSA_indexer_backward_wrapper_v2_multi_stream(
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -1476,7 +1476,7 @@ def test_DSA_indexer_backward_wrapper_v2_stream_none_ambient_streams(
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -1595,7 +1595,7 @@ def test_DSA_indexer_backward_wrapper_v2_stream_per_thread_two_threads(
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     cfg = dsa_init(
         request=request,
@@ -1702,12 +1702,12 @@ def test_DSA_indexer_backward_wrapper_v2_multi_device(
         from cuda.bindings import driver as cuda  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     if torch.cuda.device_count() < 2:
         pytest.skip("2+ CUDA devices required")
-    if torch.cuda.get_device_capability(1) != (10, 0):
-        pytest.skip("SM100 required on the second device")
+    if torch.cuda.get_device_capability(1)[0] != 10:
+        pytest.skip("SM100-family required on the second device")
 
     cfg = dsa_init(
         request=request,
@@ -1853,7 +1853,7 @@ def test_DSA_indexer_backward_v2_plan_device_capability(
         from cuda.bindings import driver as cuda  # noqa: F401
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_sm100_family()
 
     # Build a real, valid backend="sm100_v2" plan on the true (SM100) device
     # BEFORE patching, so dsa_init's own capability gate and the tensor

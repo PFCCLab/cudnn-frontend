@@ -354,10 +354,10 @@ class IndexerBackward(APIBase):
             b, s_q, s_k = self.batch, self.seqlen, self.seqlen_k
             h, d, topk = self.heads, self.head_dim, self.topk
             self._runtime_error_if(
-                torch.cuda.get_device_capability(self.iq_desc.device) != (10, 0),
-                f"backend='sm100_v2' requires an SM100 device (capability (10, 0)); the plan device "
+                torch.cuda.get_device_capability(self.iq_desc.device)[0] != 10,
+                f"backend='sm100_v2' requires an SM100-family device (capability major 10); the plan device "
                 f"{self.iq_desc.device} reports {torch.cuda.get_device_capability(self.iq_desc.device)} "
-                f"(use backend='default' on non-SM100)",
+                f"(use backend='default' otherwise)",
             )
             self._value_error_if(
                 h != 64 or d != 128,

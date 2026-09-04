@@ -1633,7 +1633,7 @@ def indexer_backward_v2_sm100(
     at the gate itself). ``batch``/``seqlen``/``seqlen_k``
     fix the plan's shape; execute re-validates the real tensors against it.
     """
-    if torch.cuda.get_device_capability() != (10, 0):
+    if torch.cuda.get_device_capability()[0] != 10:
         raise RuntimeError("indexer_backward_v2_sm100 requires SM100; use backend='default' elsewhere")
     if heads != 64 or dim != 128:
         raise ValueError(f"indexer backward v2 is specialized for H=64, D=128 (got H={heads}, D={dim})")
