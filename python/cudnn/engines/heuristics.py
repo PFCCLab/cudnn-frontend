@@ -38,7 +38,7 @@ from typing import Any, Callable, List, Optional
 
 from .base import BaseEngine, PlanConfig, decline_types
 
-_LOG = logging.getLogger("cudnn.engines.heuristics")
+_LOG = logging.getLogger(__name__)
 
 
 def default_modes() -> List[Any]:

@@ -505,7 +505,7 @@ def test_unpinned_plan_that_declines_advances_the_walk(monkeypatch, caplog):
     g.matmul(torch.randn(2, 2), torch.randn(2, 2))
     g.create_execution_plans()
     assert _plan_names(g) == ["declines_at_build", works.name]
-    with caplog.at_level(logging.INFO, logger="cudnn.pygraph"):
+    with caplog.at_level(logging.INFO, logger="cudnn._pygraph"):
         g.build_plans()
     assert any("declined at build time" in r.getMessage() for r in caplog.records)
     assert g.selected_engine is works

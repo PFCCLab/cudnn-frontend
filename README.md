@@ -176,6 +176,28 @@ export CUDNN_FRONTEND_LOG_FILE=execution_log.txt
 
 Alternatively, you can control logging programmatically via `cudnn_frontend::isLoggingEnabled()`.
 
+**Python logging:**
+
+The Python package logs through the standard `logging` module, under the `cudnn` logger. Its level defaults to `WARNING` rather than being inherited from
+your root logger, so the `DEBUG`/`INFO` traces — several of which are emitted per kernel launch — stay off in an application that runs its own root logger
+at `DEBUG`. Warnings and errors are unaffected. To turn the traces on:
+
+```bash
+export CUDNN_FRONTEND_PY_LOG_LEVEL=DEBUG   # or INFO, or a number, e.g. 10
+```
+
+or, from the application:
+
+```python
+import logging
+
+logging.getLogger("cudnn").setLevel(logging.DEBUG)                      # the whole package
+logging.getLogger("cudnn.deepseek_sparse_attention").setLevel(logging.DEBUG)  # one subtree
+```
+
+Every logger is named after its module, so any prefix works as a filter, down to the individual kernel API class
+(`cudnn.deepseek_sparse_attention.indexer_backward.api.IndexerBackward`).
+
 **OSS engine selection:**
 
 The open-source engines are opt-in while they mature: set the flag below and they become candidates

@@ -36,7 +36,10 @@ from .engines.engine_ids import is_python_engine
 from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor
 from .nodes import Node, _row_major_stride
 
-_LOG = logging.getLogger("cudnn.pygraph")
+# __name__, not a literal: a hardcoded "cudnn.*" name still resolves to the
+# stock root when this package is vendored under another one, and then it is
+# not covered by the package default set in cudnn/__init__.py.
+_LOG = logging.getLogger(__name__)
 
 
 def _is_dense(dim, stride) -> bool:

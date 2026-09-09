@@ -3,10 +3,54 @@
 
 import ctypes
 import glob
+import logging
 import os
 import sys
 import sysconfig
 import importlib
+
+# Root of this package's logger tree. Every logger in the package is named after
+# its module, so all of them are descendants of this one and this is the single
+# place that configures them.
+#
+# The NullHandler is the usual library convention: a record emitted before the
+# application has configured any handler must not fall through to logging's
+# "last resort" stderr writer.
+#
+# The explicit level is the load-bearing part. Without it this logger inherits
+# the *root* logger's level, and an application that sets its root to DEBUG --
+# the default in several training frameworks -- turns on every logger.debug() in
+# this package at once. Several of those sit on per-execute paths (each
+# ApiBase.execute, the DSA indexer forward/backward, the top-k kernel), so the
+# application gets one line per kernel launch, per layer, per step. Those
+# records are traces for debugging cuDNN, not something the embedding
+# application asked for, and at that rate they bury its own output.
+#
+# WARNING rather than INFO, for two reasons. Everything this package logs below
+# WARNING is such a trace -- including a few per-call INFO lines (tensor
+# padding, internally computed ragged offsets). And it makes the change
+# non-increasing at every root level: propagation re-checks handler levels but
+# not the root logger's own level, so pinning INFO here would newly surface
+# those INFO lines in an application whose root sits at WARNING, trading one
+# flood for another.
+#
+# To get the traces back, either set CUDNN_FRONTEND_PY_LOG_LEVEL (name chosen to
+# sit beside the C++ side's CUDNN_FRONTEND_LOG_INFO / CUDNN_FRONTEND_LOG_FILE)
+# or call logging.getLogger("cudnn").setLevel(...) from the application -- a
+# level set on this logger or on any descendant wins, this only replaces the
+# level that would otherwise be inherited from the root.
+PY_LOG_LEVEL_ENV = "CUDNN_FRONTEND_PY_LOG_LEVEL"
+
+_package_logger = logging.getLogger(__name__)
+_package_logger.addHandler(logging.NullHandler())
+_requested_level = os.environ.get(PY_LOG_LEVEL_ENV, "").strip()
+try:
+    # A bare number is accepted too, since logging's own levels are numeric.
+    _package_logger.setLevel(int(_requested_level) if _requested_level.isdigit() else (_requested_level.upper() or "WARNING"))
+except ValueError:
+    # Importing cuDNN must not fail over a malformed debugging knob.
+    _package_logger.setLevel(logging.WARNING)
+    _package_logger.warning("ignoring %s=%r: not a logging level", PY_LOG_LEVEL_ENV, _requested_level)
 
 
 def is_windows():

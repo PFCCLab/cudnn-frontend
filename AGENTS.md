@@ -84,7 +84,7 @@ First invocation builds the hook environments and can take >5 minutes; later run
 - Every new frontend-only Python API needs: `APIBase` subclass + wrapper, lazy export in `python/cudnn/__init__.py`, docs under `docs/fe-oss-apis/`, and pytest coverage under `test/python/fe_api/`. Full recipe: [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) and the `cutedsl-kernel-integration` skill.
 - Frontend-only OSS APIs are experimental; keep the `[cutedsl]` optional-dependency boundary intact (no eager `torch`/`cutlass` imports at `cudnn` import time).
 - Version lives in three places that must stay in sync: `CMakeLists.txt` (`project(... VERSION ...)`), `include/cudnn_frontend_version.h`, `python/cudnn/__init__.py` (`__version__`).
-- Runtime debugging: set `CUDNN_FRONTEND_LOG_INFO=1` and `CUDNN_FRONTEND_LOG_FILE=stderr` for FE logs; backend logs via `CUDNN_LOGLEVEL_DBG=3 CUDNN_LOGDEST_DBG=stderr`.
+- Runtime debugging: set `CUDNN_FRONTEND_LOG_INFO=1` and `CUDNN_FRONTEND_LOG_FILE=stderr` for FE logs; backend logs via `CUDNN_LOGLEVEL_DBG=3 CUDNN_LOGDEST_DBG=stderr`. Python-side traces are off by default (the `cudnn` logger is pinned to `WARNING` so it does not follow an application root set to `DEBUG`) — enable with `CUDNN_FRONTEND_PY_LOG_LEVEL=DEBUG` or `logging.getLogger("cudnn").setLevel(...)`. Name every new logger `logging.getLogger(__name__)`, never a literal or a bare class name; `test/python/test_logging_defaults.py` enforces this.
 
 ## Agent skills
 

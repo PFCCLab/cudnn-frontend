@@ -458,7 +458,14 @@ class APIBase(ABC):
         self._interpret_uint8_as_fp4x2 = False
         self._device_type = get_device_type()
         self._is_rubin_kernel = self._device_type == "rubin"
-        self._logger = logging.getLogger(self.__class__.__name__)
+        # Module-qualified, not self.__class__.__name__: a bare class name such
+        # as "IndexerBackward" is a *root* logger child, so it escapes both
+        # logging.getLogger("cudnn").setLevel(...) and the package default set
+        # in cudnn/__init__.py, and inherits the application's root level
+        # instead. The class name stays the leaf, so per-kernel filtering still
+        # works -- as "cudnn.deepseek_sparse_attention.indexer_backward.api
+        # .IndexerBackward" rather than "IndexerBackward".
+        self._logger = logging.getLogger(f"{type(self).__module__}.{type(self).__name__}")
 
     def _warn_experimental_api(self) -> None:
         warn_experimental_api_once(self._logger, self.__class__.__name__)
