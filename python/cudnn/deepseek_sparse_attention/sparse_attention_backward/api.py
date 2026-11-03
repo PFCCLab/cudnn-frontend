@@ -17,6 +17,7 @@ import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
 
+from . import _interface_sm90 as _iface_sm90
 from . import _interface_sm100 as _iface_sm100
 
 
@@ -173,8 +174,6 @@ class SparseAttentionBackward(APIBase):
         major, _ = torch.cuda.get_device_capability()
         scale = self.softmax_scale if softmax_scale is None else softmax_scale
         if major == 9:
-            from . import _interface_sm90 as _iface_sm90
-
             return _iface_sm90.flash_attn_bwd_sm90(
                 q,
                 kv,
