@@ -762,11 +762,12 @@ def test_DSA_sparse_attention_backward_qcluster_graph_replay_switches_overlap_pa
 
 
 @pytest.mark.L0
-def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
+def test_DSA_sparse_attention_backward_deterministic_policy_is_independent(monkeypatch):
     """Keep deterministic scheduling policy separate from ordinary tuning."""
     try:
         import cutlass
 
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import dsa_bwd_sm100_deterministic as det_module
         from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
         from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic import (
             FlashAttentionDSABackwardSm100Deterministic,
@@ -789,6 +790,9 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
+    # The hardware-cluster layout is the policy on devices that cannot
+    # co-schedule the wide cooperative wave; the wide path has its own test.
+    monkeypatch.setattr(det_module, "_current_device_supports_wide_relay", lambda wave_ctas: False)
     assert issubclass(FlashAttentionDSABackwardSm100Deterministic, FlashAttentionDSABackwardSm100)
     assert FlashAttentionDSABackwardSm100Deterministic.num_dkv_shards == 128
     assert FlashAttentionDSABackwardSm100Deterministic.q_wave_ctas == FlashAttentionDSABackwardSm100Deterministic.num_dkv_shards
@@ -922,6 +926,47 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
             deterministic_kernel_class(257, 65537, 512, deterministic_relay_cluster_size=value)
     assert FlashAttentionDSABackwardSm100.q_wave_ctas == 0
     assert not FlashAttentionDSABackwardSm100.serialize_head_blocks
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_deterministic_wide_relay_policy(monkeypatch):
+    """Automatic cluster-4 plans widen to a cooperative 144-CTA wave when it fits."""
+    try:
+        import cutlass
+
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import dsa_bwd_sm100_deterministic as det_module
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    cluster4 = det_module.FlashAttentionDSABackwardSm100DeterministicCluster4
+    wide = det_module.FlashAttentionDSABackwardSm100DeterministicCluster4Wide
+    assert issubclass(wide, cluster4)
+    assert wide.q_wave_ctas == 144
+    assert wide.num_dkv_shards == 36
+    assert wide.dkv_relay_cluster_size == 4
+    assert wide.dkv_mask_rows_per_word == 8
+    assert wide.dkv_cooperative_relay and not cluster4.dkv_cooperative_relay
+    assert wide.num_dkv_final_terms == wide.num_dkv_shards
+    assert not wide.run_dkv_prefold
+    dkv_shape = wide._get_workspace_size_dKV_for_q(16384, 278528, 576, 64, 1, cutlass.Float32)
+    assert math.prod(dkv_shape) == det_module._relay_workspace_bytes(16384, 278528, 576, 64, 4, wide.q_wave_ctas)
+
+    monkeypatch.setattr(det_module, "_current_device_supports_wide_relay", lambda wave_ctas: wave_ctas <= 148)
+    assert det_module.deterministic_kernel_class(16384, 278528, 576) is wide
+    assert det_module.deterministic_kernel_class(8192, 65537, 512) is wide
+    # Explicit overrides keep the hardware-cluster layout.
+    assert det_module.deterministic_kernel_class(16384, 278528, 576, deterministic_relay_cluster_size=4) is cluster4
+    # Cluster-8 and cluster-16 plans are unchanged.
+    assert det_module.deterministic_kernel_class(8191, 65537, 512) is det_module.FlashAttentionDSABackwardSm100DeterministicCluster8
+    assert det_module.deterministic_kernel_class(16384, 524288, 576) is det_module.FlashAttentionDSABackwardSm100DeterministicCluster16
+    # At the cluster-4 budget edge the wider plane set no longer fits; keep 32 planes.
+    assert det_module._relay_workspace_bytes(16384, 453432, 576, 64, 4, wide.q_wave_ctas) > det_module._RELAY_WORKSPACE_BUDGET_BYTES
+    assert det_module.deterministic_kernel_class(16384, 453432, 576) is cluster4
+    assert det_module._deterministic_kernel_class_for_config(36, 4) is wide
+    assert det_module._deterministic_kernel_class_for_config(32, 4) is cluster4
+
+    monkeypatch.setattr(det_module, "_current_device_supports_wide_relay", lambda wave_ctas: False)
+    assert det_module.deterministic_kernel_class(16384, 278528, 576) is cluster4
 
 
 @pytest.mark.L0

@@ -50,6 +50,10 @@ class FlashAttentionDSABackwardSm100:
     dkv_cluster_shape = (1, 1, 1)
     dkv_relay_cluster_size = 1
     dkv_relay_phases = 1
+    # Co-schedule relay ranks with a cooperative launch of single-CTA clusters
+    # instead of hardware clusters. A relay group no longer has to fit one GPC,
+    # so a wave can cover every SM rather than the GPC-packable cluster count.
+    dkv_cooperative_relay = False
 
     def __init__(
         self,
@@ -703,7 +707,10 @@ class FlashAttentionDSABackwardSm100:
         q_wave_size = self.q_wave_ctas if cutlass.const_expr(self.q_wave_ctas > 0) else problem_shape[0]
         if cutlass.const_expr(self.q_wave_ctas > 0):
             assert self.q_wave_ctas % self.dkv_relay_phases == 0
-            assert self.dkv_relay_cluster_size == self.dkv_cluster_shape[0] * self.dkv_relay_phases
+            if cutlass.const_expr(self.dkv_cooperative_relay):
+                assert self.dkv_relay_phases == 1 and self.q_wave_ctas % self.dkv_relay_cluster_size == 0
+            else:
+                assert self.dkv_relay_cluster_size == self.dkv_cluster_shape[0] * self.dkv_relay_phases
         q_launch_size = q_wave_size // self.dkv_relay_phases
         if cutlass.const_expr(self.serialize_head_blocks):
             num_head_block_phases = num_head_blocks
@@ -765,10 +772,11 @@ class FlashAttentionDSABackwardSm100:
                     ).launch(
                         grid=(q_launch_size, head_blocks_per_launch, bwd_problem_shape[3][1]),
                         block=[self.threads_per_cta, 1, 1],
-                        cluster=self.dkv_cluster_shape,
+                        cluster=(1, 1, 1) if cutlass.const_expr(self.dkv_cooperative_relay) else self.dkv_cluster_shape,
                         smem=self.shared_storage.size_in_bytes(),
                         stream=stream,
                         min_blocks_per_mp=1,
+                        cooperative=self.dkv_cooperative_relay,
                     )
 
         if cutlass.const_expr(self.finalize_dkv):
@@ -979,7 +987,9 @@ class FlashAttentionDSABackwardSm100:
         token_idx = wave_idx
         if cutlass.const_expr(self.serialize_head_blocks):
             head_block_idx += head_block_offset
-        if cutlass.const_expr(self.q_wave_ctas > 0):
+        if cutlass.const_expr(self.q_wave_ctas > 0 and self.dkv_cooperative_relay):
+            token_idx = q_offset + wave_idx
+        elif cutlass.const_expr(self.q_wave_ctas > 0):
             physical_cluster_size = self.dkv_cluster_shape[0]
             logical_group_idx = wave_idx // physical_cluster_size
             physical_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())

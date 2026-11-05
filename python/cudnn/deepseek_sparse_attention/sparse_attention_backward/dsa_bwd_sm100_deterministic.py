@@ -20,6 +20,11 @@ _SUPPORTED_DKV_SHARDS = (32, 64, 128)
 _LARGE_CONTEXT_WORKSPACE_BYTES = 16 << 30
 _RELAY_WORKSPACE_BUDGET_BYTES = 32 << 30
 _RELAY_WAVE_CTAS = 128
+# Wave width of the cooperative four-CTA relay. A cooperative launch of
+# single-CTA clusters has no GPC packing limit, so the wave can grow from the
+# 32 hardware clusters (128 CTAs) that stay resident to 36 four-CTA relay
+# groups. It must not exceed the device SM count (one CTA per SM).
+_RELAY_WIDE_WAVE_CTAS = 144
 _CLUSTER4_MIN_Q = 8192
 
 
@@ -96,14 +101,21 @@ def use_cluster_dkv_relay(total_seqlen_q: int, total_seqlen_kv: int, head_dim: i
     return num_shards * k * d * 4 > _LARGE_CONTEXT_WORKSPACE_BYTES
 
 
-def _relay_workspace_bytes(total_seqlen_q: int, total_seqlen_kv: int, head_dim: int, num_heads: int, cluster_size: int) -> int:
+def _relay_workspace_bytes(
+    total_seqlen_q: int,
+    total_seqlen_kv: int,
+    head_dim: int,
+    num_heads: int,
+    cluster_size: int,
+    wave_ctas: int = _RELAY_WAVE_CTAS,
+) -> int:
     """Return the complete FP32-plane and packed-mask relay allocation."""
     k = (int(total_seqlen_kv) + 7) // 8 * 8
     d = (int(head_dim) + 7) // 8 * 8
-    num_planes = _RELAY_WAVE_CTAS // cluster_size
+    num_planes = wave_ctas // cluster_size
     mask_word_bits = 64 if cluster_size == 64 else 32
     mask_rows_per_word = mask_word_bits // cluster_size
-    num_waves = (int(total_seqlen_q) + _RELAY_WAVE_CTAS - 1) // _RELAY_WAVE_CTAS
+    num_waves = (int(total_seqlen_q) + wave_ctas - 1) // wave_ctas
     num_head_blocks = (int(num_heads) + 63) // 64
     mask_words = num_waves * num_head_blocks * ((k + mask_rows_per_word - 1) // mask_rows_per_word)
     mask_elements = mask_words * (mask_word_bits // 32)
@@ -799,6 +811,23 @@ class FlashAttentionDSABackwardSm100DeterministicCluster4(_FlashAttentionDSABack
     dkv_final_stride = 1
 
 
+class FlashAttentionDSABackwardSm100DeterministicCluster4Wide(FlashAttentionDSABackwardSm100DeterministicCluster4):
+    """Thirty-six-plane four-CTA relay over a 144-CTA cooperative wave.
+
+    Relay ranks are co-scheduled by a cooperative launch of single-CTA
+    clusters instead of hardware clusters, so the wave is not capped by how
+    many four-CTA clusters fit the GPCs. Each plane still has exactly four
+    ordered ranks and the same row-rank masks; only the plane count and the
+    number of waves change.
+    """
+
+    q_wave_ctas = _RELAY_WIDE_WAVE_CTAS
+    num_dkv_shards = q_wave_ctas // FlashAttentionDSABackwardSm100DeterministicCluster4.dkv_relay_cluster_size
+    num_dkv_fold_groups = max(1, num_dkv_shards // _FlashAttentionDSABackwardSm100DeterministicRelay.dkv_fold_group_size)
+    num_dkv_final_terms = num_dkv_shards
+    dkv_cooperative_relay = True
+
+
 _DETERMINISTIC_KERNELS = {
     32: FlashAttentionDSABackwardSm100Deterministic32,
     64: FlashAttentionDSABackwardSm100Deterministic64,
@@ -812,6 +841,39 @@ _DETERMINISTIC_RELAY_KERNELS = {
     32: FlashAttentionDSABackwardSm100DeterministicCluster32,
     64: FlashAttentionDSABackwardSm100DeterministicCluster64,
 }
+
+# Automatic cluster-4 plans use the cooperative wide wave when the current
+# device can co-schedule it; explicit cluster-size overrides keep the
+# hardware-cluster layout.
+_DETERMINISTIC_WIDE_RELAY_KERNELS = {
+    4: FlashAttentionDSABackwardSm100DeterministicCluster4Wide,
+}
+
+
+def _current_device_supports_wide_relay(wave_ctas: int) -> bool:
+    """Return whether the current CUDA device can co-schedule ``wave_ctas`` CTAs."""
+    err, device = cuda.cuCtxGetDevice()
+    if err != cuda.CUresult.CUDA_SUCCESS:
+        return False
+    attr = cuda.CUdevice_attribute
+    err, cooperative = cuda.cuDeviceGetAttribute(attr.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device)
+    if err != cuda.CUresult.CUDA_SUCCESS or not cooperative:
+        return False
+    err, sm_count = cuda.cuDeviceGetAttribute(attr.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device)
+    return err == cuda.CUresult.CUDA_SUCCESS and sm_count >= wave_ctas
+
+
+def _automatic_relay_kernel(total_seqlen_q: int, total_seqlen_kv: int, head_dim: int, num_heads: int, relay_width: int):
+    """Prefer the wide cooperative wave for automatic plans that fit the budget."""
+    wide_cls = _DETERMINISTIC_WIDE_RELAY_KERNELS.get(relay_width)
+    if (
+        wide_cls is not None
+        and _relay_workspace_bytes(total_seqlen_q, total_seqlen_kv, head_dim, num_heads, relay_width, wide_cls.q_wave_ctas)
+        <= _RELAY_WORKSPACE_BUDGET_BYTES
+        and _current_device_supports_wide_relay(wide_cls.q_wave_ctas)
+    ):
+        return wide_cls
+    return _DETERMINISTIC_RELAY_KERNELS[relay_width]
 
 
 def deterministic_kernel_class(
@@ -840,7 +902,7 @@ def deterministic_kernel_class(
                 if type(deterministic_relay_cluster_size) is not int or deterministic_relay_cluster_size not in _DETERMINISTIC_RELAY_KERNELS:
                     raise ValueError("deterministic_relay_cluster_size must be one of {4, 8, 16, 32, 64}, " f"got {deterministic_relay_cluster_size!r}")
                 return _DETERMINISTIC_RELAY_KERNELS[deterministic_relay_cluster_size]
-            return _DETERMINISTIC_RELAY_KERNELS[relay_width]
+            return _automatic_relay_kernel(total_seqlen_q, total_seqlen_kv, head_dim, num_heads, relay_width)
         if deterministic_relay_cluster_size is not None:
             raise ValueError("deterministic_relay_cluster_size is valid only when the deterministic large-context relay is selected")
     elif deterministic_relay_cluster_size is not None:
@@ -864,6 +926,9 @@ def _deterministic_kernel_class_for_config(num_shards: int, relay_cluster_size: 
         kernel_cls = _DETERMINISTIC_RELAY_KERNELS[relay_cluster_size]
     except KeyError as exc:
         raise ValueError(f"unsupported deterministic dKV relay cluster size {relay_cluster_size}") from exc
+    wide_cls = _DETERMINISTIC_WIDE_RELAY_KERNELS.get(relay_cluster_size)
+    if kernel_cls.num_dkv_shards != num_shards and wide_cls is not None and wide_cls.num_dkv_shards == num_shards:
+        return wide_cls
     if kernel_cls.num_dkv_shards != num_shards:
         raise ValueError("inconsistent deterministic dKV relay configuration: " f"{num_shards} planes with cluster size {relay_cluster_size}")
     return kernel_cls
