@@ -528,7 +528,7 @@ def test_DSA_sparse_attention_backward_deterministic_compile_cache_is_device_sco
 
     compile_artifact = interface._compile_deterministic_sm100
     compile_artifact.cache_clear()
-    monkeypatch.setattr(interface, "_deterministic_kernel_class_for_config", lambda shards, relay_size: FakeKernel)
+    monkeypatch.setattr(interface, "_deterministic_kernel_class_for_config", lambda shards, relay_size, first_touch=False: FakeKernel)
     monkeypatch.setattr(interface, "_fake_compact_tensor", lambda *args, **kwargs: object())
     monkeypatch.setattr(interface.cute, "sym_int", lambda: object())
     monkeypatch.setattr(interface.cute.runtime, "make_fake_stream", lambda **kwargs: object())
@@ -951,9 +951,22 @@ def test_DSA_sparse_attention_backward_deterministic_wide_relay_policy(monkeypat
     dkv_shape = wide._get_workspace_size_dKV_for_q(16384, 278528, 576, 64, 1, cutlass.Float32)
     assert math.prod(dkv_shape) == det_module._relay_workspace_bytes(16384, 278528, 576, 64, 4, wide.q_wave_ctas)
 
+    first_touch = det_module.FlashAttentionDSABackwardSm100DeterministicCluster4WideFirstTouch
+    assert issubclass(first_touch, wide)
+    assert first_touch.dkv_first_touch_store and not wide.dkv_first_touch_store and not cluster4.dkv_first_touch_store
+    assert first_touch.num_dkv_shards == wide.num_dkv_shards
+    ft_shape = first_touch._get_workspace_size_dKV_for_q(16384, 278528, 576, 64, 1, cutlass.Float32)
+    assert math.prod(ft_shape) == det_module._relay_workspace_bytes(16384, 278528, 576, 64, 4, wide.q_wave_ctas, True)
+    # First-touch adds one owner word per KV row to each plane.
+    assert ft_shape[2] - dkv_shape[2] == math.ceil(278528 / 576)
+
     monkeypatch.setattr(det_module, "_current_device_supports_wide_relay", lambda wave_ctas: wave_ctas <= 148)
-    assert det_module.deterministic_kernel_class(16384, 278528, 576) is wide
-    assert det_module.deterministic_kernel_class(8192, 65537, 512) is wide
+    # Wide plans with S_kv >= 8 * S_q skip the data-plane clear.
+    assert det_module.deterministic_kernel_class(16384, 278528, 576) is first_touch
+    assert det_module.deterministic_kernel_class(16384, 131072, 576) is first_touch
+    assert det_module.deterministic_kernel_class(16384, 131071, 576) is wide
+    assert det_module.deterministic_kernel_class(8192, 65537, 512) is first_touch
+    assert det_module.deterministic_kernel_class(16384, 65536, 576) is wide
     # Explicit overrides keep the hardware-cluster layout.
     assert det_module.deterministic_kernel_class(16384, 278528, 576, deterministic_relay_cluster_size=4) is cluster4
     # Cluster-8 and cluster-16 plans are unchanged.
@@ -964,6 +977,9 @@ def test_DSA_sparse_attention_backward_deterministic_wide_relay_policy(monkeypat
     assert det_module.deterministic_kernel_class(16384, 453432, 576) is cluster4
     assert det_module._deterministic_kernel_class_for_config(36, 4) is wide
     assert det_module._deterministic_kernel_class_for_config(32, 4) is cluster4
+    assert det_module._deterministic_kernel_class_for_config(36, 4, True) is first_touch
+    with pytest.raises(ValueError, match="first-touch"):
+        det_module._deterministic_kernel_class_for_config(32, 4, True)
     # Long query batches below the 128-shard cap also take the wide relay;
     # shorter ones keep the bounded-wave shards.
     assert not det_module.use_cluster_dkv_relay(16384, 16384, 576)
@@ -1075,7 +1091,8 @@ def test_DSA_sparse_attention_backward_sm100_large_context_workspace_uses_cluste
     mask_words_per_plane = num_waves * num_head_blocks * (padded_kv // mask_rows_per_word)
     mask_rows_per_plane = math.ceil(mask_words_per_plane / head_dim)
     lse_odo_bytes = num_heads * padded_q * 2 * torch.float32.itemsize
-    dkv_bytes = kernel_cls.num_dkv_shards * (padded_kv + mask_rows_per_plane) * head_dim * torch.float32.itemsize
+    owner_rows_per_plane = math.ceil(padded_kv / head_dim) if kernel_cls.dkv_first_touch_store else 0
+    dkv_bytes = kernel_cls.num_dkv_shards * (padded_kv + mask_rows_per_plane + owner_rows_per_plane) * head_dim * torch.float32.itemsize
     assert interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64") == lse_odo_bytes + dkv_bytes
 
 

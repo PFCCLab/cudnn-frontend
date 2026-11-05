@@ -26,6 +26,10 @@ _RELAY_WAVE_CTAS = 128
 # groups. It must not exceed the device SM count (one CTA per SM).
 _RELAY_WIDE_WAVE_CTAS = 144
 _CLUSTER4_MIN_Q = 8192
+# Wide relays switch to first-touch stores once S_kv >= 8 * S_q. Skipping the
+# data-plane clear saves bandwidth proportional to S_kv, while the store branch
+# costs time per query wave; measured on B300, the clear dominates from 8x.
+_FIRST_TOUCH_MIN_KV_PER_Q = 8
 
 
 @dsl_user_op
@@ -108,8 +112,9 @@ def _relay_workspace_bytes(
     num_heads: int,
     cluster_size: int,
     wave_ctas: int = _RELAY_WAVE_CTAS,
+    first_touch: bool = False,
 ) -> int:
-    """Return the complete FP32-plane and packed-mask relay allocation."""
+    """Return the complete FP32-plane, packed-mask, and first-owner relay allocation."""
     k = (int(total_seqlen_kv) + 7) // 8 * 8
     d = (int(head_dim) + 7) // 8 * 8
     num_planes = wave_ctas // cluster_size
@@ -120,7 +125,8 @@ def _relay_workspace_bytes(
     mask_words = num_waves * num_head_blocks * ((k + mask_rows_per_word - 1) // mask_rows_per_word)
     mask_elements = mask_words * (mask_word_bits // 32)
     mask_rows = (mask_elements + d - 1) // d
-    return num_planes * (k + mask_rows) * d * 4
+    owner_rows = (k + d - 1) // d if first_touch else 0
+    return num_planes * (k + mask_rows + owner_rows) * d * 4
 
 
 def deterministic_dkv_relay_cluster_size(total_seqlen_q: int, total_seqlen_kv: int, head_dim: int, num_heads: int = 64) -> int:
@@ -425,7 +431,7 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         b: int,
         acc_dtype: Type[cutlass.Numeric],
     ):
-        """Add packed per-wave row-rank masks after each plane's data."""
+        """Add packed per-wave row-rank masks, plus first-owner words under first-touch, after each plane's data."""
         d = (d + 7) // 8 * 8
         k = (k + 7) // 8 * 8
         num_waves = (q + cls.q_wave_ctas - 1) // cls.q_wave_ctas
@@ -433,8 +439,9 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         mask_words = num_waves * num_head_blocks * ((k + cls.dkv_mask_rows_per_word - 1) // cls.dkv_mask_rows_per_word)
         mask_elements = mask_words * (cls.dkv_mask_word_bits // 32)
         mask_rows = (mask_elements + d - 1) // d
+        owner_rows = (k + d - 1) // d if cls.dkv_first_touch_store else 0
         workspace_bytes = d * acc_dtype.width // 8
-        return (b, cls.num_dkv_shards, k + mask_rows, workspace_bytes)
+        return (b, cls.num_dkv_shards, k + mask_rows + owner_rows, workspace_bytes)
 
     @cute.jit
     def make_dKV_accumulator(
@@ -461,14 +468,75 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         seqlen: Int32,
         stream: cuda.CUstream,
     ):
-        """Clear all data planes and their trailing packed masks."""
+        """Clear the packed masks and owners, or every plane row without first-touch stores."""
         rows_per_cta = 64
-        num_rows = mdKV_acc.shape[1]
-        self.clear_dKV_workspace(mdKV_acc, num_rows).launch(
-            grid=[cute.ceil_div(num_rows, rows_per_cta), 1, 1],
-            block=[32, 8, 1],
-            stream=stream,
-        )
+        if cutlass.const_expr(self.dkv_first_touch_store):
+            assert not self.run_dkv_prefold, "first-touch planes need the owner-aware convert fold"
+            data_rows = cute.round_up(seqlen, 8)
+            tail_rows = self._physical_rows_per_plane(mdKV_acc) - data_rows
+            self.clear_dKV_relay_metadata(mdKV_acc, data_rows).launch(
+                grid=[cute.ceil_div(tail_rows, rows_per_cta), self.num_dkv_shards, 1],
+                block=[32, 8, 1],
+                stream=stream,
+            )
+        else:
+            num_rows = mdKV_acc.shape[1]
+            self.clear_dKV_workspace(mdKV_acc, num_rows).launch(
+                grid=[cute.ceil_div(num_rows, rows_per_cta), 1, 1],
+                block=[32, 8, 1],
+                stream=stream,
+            )
+
+    @cute.kernel
+    def clear_dKV_relay_metadata(self, mdKV_acc: cute.Tensor, data_rows: Int32):
+        """Zero the rows after each plane's data: packed masks, then owners."""
+        tidx, tidy, _ = cute.arch.thread_idx()
+        row_block, plane_idx, _ = cute.arch.block_idx()
+        rows_per_cta = 64
+        physical_rows = self._physical_rows_per_plane(mdKV_acc)
+        tail_rows = physical_rows - data_rows
+        for row_in_block in cutlass.range(tidy, rows_per_cta, 8, unroll_full=True):
+            tail_row = row_block * rows_per_cta + row_in_block
+            if tail_row < tail_rows:
+                row_idx = plane_idx * physical_rows + data_rows + tail_row
+                for dim_idx in cutlass.range(tidx, self.head_dim, 32):
+                    mdKV_acc[dim_idx, row_idx, (0, 0)] = Float32(0.0)
+
+    @cute.jit
+    def _owner_word_ptr(self, mdKV_acc: cute.Tensor, max_seqlen_kv: Int32, plane_idx: Int32, kv_row: Int32):
+        """Point at one plane row's first-owner word in the plane's last rows."""
+        physical_rows = self._physical_rows_per_plane(mdKV_acc)
+        owner_rows = cute.ceil_div(cute.round_up(max_seqlen_kv, 8), self.head_dim)
+        owner_base = (Int64(plane_idx) * Int64(physical_rows) + Int64(physical_rows - owner_rows)) * Int64(self.head_dim)
+        return cute.recast_ptr(mdKV_acc.iterator, dtype=Int32) + owner_base + Int64(kv_row)
+
+    @cute.jit
+    def _owner_code(self, token_idx: Int32) -> Int32:
+        """Encode a token so the earliest token has the largest nonzero even code.
+
+        build_dKV_relay_masks raises a row's word to code + 1 when the token
+        selects the row more than once, so the owner then never stores.
+        """
+        return (Int32(0x3FFFFFFF) - token_idx) * Int32(2)
+
+    @cute.jit
+    def dKV_first_touch_owner_words(self, mdKV_acc: cute.Tensor, max_seqlen_kv: Int32, token_idx: Int32):
+        """View this token's plane owner words as a plain tensor; built once per token."""
+        ptr = self._owner_word_ptr(mdKV_acc, max_seqlen_kv, self._relay_plane(token_idx), Int32(0))
+        return cute.make_tensor(ptr, cute.make_layout(max_seqlen_kv))
+
+    @cute.jit
+    def dKV_first_touch_flag(self, owner_words, owner_code: Int32, head_block_idx: Int32, kv_row: Int32) -> Int32:
+        """Return one when this token's first head block makes the row's first plane update.
+
+        A token that selects the row more than once never stores (its word is
+        code + 1): its occurrences add onto the row build_dKV_relay_masks zeroed.
+        """
+        flag = Int32(0)
+        if kv_row >= 0 and head_block_idx == 0:
+            if owner_words[kv_row] == owner_code:
+                flag = Int32(1)
+        return flag
 
     @cute.jit
     def _physical_rows_per_plane(self, mdKV_acc: cute.Tensor) -> Int32:
@@ -540,14 +608,34 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         mask_dtype = self.dkv_mask_dtype
         bit_in_row = mask_dtype(1) << mask_dtype(rank)
         num_head_blocks = cute.ceil_div(problem_shape[3][0], self.block_tile)
+        owner_words, owner_code = None, None
+        if cutlass.const_expr(self.dkv_first_touch_store):
+            owner_words = self.dKV_first_touch_owner_words(mdKV_acc, problem_shape[1], token_idx)
+            owner_code = self._owner_code(token_idx)
         for slot in cutlass.range(tidx, topk, 256):
             kv_row = mTopkIdxs[slot, (token_idx, batch_idx)]
             if kv_row >= 0 and kv_row < problem_shape[1]:
                 row_shift = mask_dtype((kv_row % self.dkv_mask_rows_per_word) * self.dkv_relay_cluster_size)
                 bit = bit_in_row << row_shift
-                for head_block_idx in cutlass.range(num_head_blocks, unroll=1):
+                mask_ptr = self._mask_word_ptr(mdKV_acc, problem_shape[1], token_idx, Int32(0), problem_shape, kv_row)
+                old_mask = cute.arch.atomic_or(mask_ptr.llvm_ptr, bit, sem="relaxed", scope="gpu")
+                for head_block_idx in cutlass.range(1, num_head_blocks, unroll=1):
                     mask_ptr = self._mask_word_ptr(mdKV_acc, problem_shape[1], token_idx, head_block_idx, problem_shape, kv_row)
                     cute.arch.atomic_or(mask_ptr.llvm_ptr, bit, sem="relaxed", scope="gpu")
+                if cutlass.const_expr(self.dkv_first_touch_store):
+                    # The word only grows, so a smaller-or-equal snapshot already loses.
+                    if owner_words[kv_row] < owner_code:
+                        owner_ptr = owner_words.iterator + kv_row
+                        cute.arch.atomic_max(owner_ptr.llvm_ptr, owner_code, sem="relaxed", scope="gpu")
+                    if (old_mask & bit) != mask_dtype(0):
+                        # This token selects the row again. If it owns the row, no
+                        # occurrence stores, so the row must start from zero; zeroing
+                        # a row some earlier token owns is harmless (it stores over it).
+                        owner_ptr = owner_words.iterator + kv_row
+                        cute.arch.atomic_max(owner_ptr.llvm_ptr, owner_code + Int32(1), sem="relaxed", scope="gpu")
+                        row_idx = self._relay_plane(token_idx) * self._physical_rows_per_plane(mdKV_acc) + kv_row
+                        for col in cutlass.range(self.head_dim, unroll=1):
+                            mdKV_acc[col, row_idx, (0, batch_idx)] = self.acc_dtype(0.0)
 
     @cute.jit
     def prepare_dKV_relay(
@@ -665,7 +753,7 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
                 mdKV_acc[dim_idx, seq_id + group_begin * physical_rows, (0, 0)] = acc
 
     @cute.jit
-    def _convert_plane_major(self, mdKV_acc: cute.Tensor, mdKV: cute.Tensor, seq_id: Int32, batch_idx: Int32, tidx: Int32, physical_rows: Int32):
+    def _convert_plane_major(self, mdKV_acc: cute.Tensor, mdKV: cute.Tensor, seq_id: Int32, batch_idx: Int32, tidx: Int32, physical_rows: Int32, seqlen: Int32):
         """Same per-element FP32 order as the plane loop below, but planes are the outer loop.
 
         Every thread keeps all of its row elements in registers and issues one
@@ -682,6 +770,9 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
             row = mdKV_acc[None, seq_id + shard_idx * physical_rows, (0, batch_idx)]
             tile = cute.flat_divide(cute.flat_divide(row, (64,)), (32,))
             vals = [tile[tidx, j, i] for (j, i) in cols]
+            if cutlass.const_expr(self.dkv_first_touch_store):
+                touched = cute.arch.load(self._owner_word_ptr(mdKV_acc, seqlen, Int32(shard_idx), seq_id), Int32) != Int32(0)
+                vals = [Float32(cutlass.select_(touched, v, Float32(0.0))) for v in vals]
             accs = [a + v for a, v in zip(accs, vals)]
         cur_mdKV_row = mdKV[None, seq_id, (0, batch_idx)]
         for n, (j, i) in enumerate(cols):
@@ -706,8 +797,9 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         physical_rows = self._physical_rows_per_plane(mdKV_acc)
         if cutlass.const_expr(self.plane_major_convert):
             if seq_id < seqlen:
-                self._convert_plane_major(mdKV_acc, mdKV, seq_id, batch_idx, tidx, physical_rows)
+                self._convert_plane_major(mdKV_acc, mdKV, seq_id, batch_idx, tidx, physical_rows, seqlen)
         elif seq_id < seqlen:
+            assert not self.dkv_first_touch_store, "first-touch planes fold through the plane-major convert"
             cur_mdKV_row = mdKV[None, seq_id, (0, batch_idx)]
             num_128_tiles = self.head_dim_main // 64
             for i in cutlass.range(num_128_tiles, unroll_full=True):
@@ -828,6 +920,21 @@ class FlashAttentionDSABackwardSm100DeterministicCluster4Wide(FlashAttentionDSAB
     dkv_cooperative_relay = True
 
 
+class FlashAttentionDSABackwardSm100DeterministicCluster4WideFirstTouch(FlashAttentionDSABackwardSm100DeterministicCluster4Wide):
+    """Wide relay whose first update of each plane row stores instead of adding.
+
+    The first updater of a row is the plane's lowest query token selecting it:
+    earliest wave, lowest rank, head block zero. build_dKV_relay_masks records
+    that token per row, so the data rows need no clearing pass; rows no token
+    selects keep owner zero and fold as +0.0, exactly what a cleared row
+    contributed. Only the masks and owner words are cleared. A row its owner
+    token selects more than once is zeroed by build_dKV_relay_masks and only
+    added to, since only one of its occurrences could store.
+    """
+
+    dkv_first_touch_store = True
+
+
 _DETERMINISTIC_KERNELS = {
     32: FlashAttentionDSABackwardSm100Deterministic32,
     64: FlashAttentionDSABackwardSm100Deterministic64,
@@ -847,6 +954,9 @@ _DETERMINISTIC_RELAY_KERNELS = {
 # hardware-cluster layout.
 _DETERMINISTIC_WIDE_RELAY_KERNELS = {
     4: FlashAttentionDSABackwardSm100DeterministicCluster4Wide,
+}
+_DETERMINISTIC_FIRST_TOUCH_RELAY_KERNELS = {
+    4: FlashAttentionDSABackwardSm100DeterministicCluster4WideFirstTouch,
 }
 
 
@@ -872,6 +982,14 @@ def _automatic_relay_kernel(total_seqlen_q: int, total_seqlen_kv: int, head_dim:
         <= _RELAY_WORKSPACE_BUDGET_BYTES
         and _current_device_supports_wide_relay(wide_cls.q_wave_ctas)
     ):
+        first_touch_cls = _DETERMINISTIC_FIRST_TOUCH_RELAY_KERNELS.get(relay_width)
+        if (
+            first_touch_cls is not None
+            and total_seqlen_kv >= _FIRST_TOUCH_MIN_KV_PER_Q * total_seqlen_q
+            and _relay_workspace_bytes(total_seqlen_q, total_seqlen_kv, head_dim, num_heads, relay_width, first_touch_cls.q_wave_ctas, True)
+            <= _RELAY_WORKSPACE_BUDGET_BYTES
+        ):
+            return first_touch_cls
         return wide_cls
     return _DETERMINISTIC_RELAY_KERNELS[relay_width]
 
@@ -910,7 +1028,7 @@ def deterministic_kernel_class(
             # wide relay when available: it is no slower and keeps 36 planes
             # instead of 128 shards.
             wide_cls = _automatic_relay_kernel(total_seqlen_q, total_seqlen_kv, head_dim, num_heads, 4)
-            if wide_cls is _DETERMINISTIC_WIDE_RELAY_KERNELS[4]:
+            if issubclass(wide_cls, _DETERMINISTIC_WIDE_RELAY_KERNELS[4]):
                 return wide_cls
     elif deterministic_relay_cluster_size is not None:
         raise ValueError("deterministic_relay_cluster_size requires total_seqlen_kv and head_dim")
@@ -925,8 +1043,13 @@ def _deterministic_kernel_class_for_shards(num_shards: int):
         raise ValueError(f"unsupported deterministic dKV shard count {num_shards}") from exc
 
 
-def _deterministic_kernel_class_for_config(num_shards: int, relay_cluster_size: int):
+def _deterministic_kernel_class_for_config(num_shards: int, relay_cluster_size: int, first_touch: bool = False):
     """Reconstruct the plan-time specialization from its cache-key fields."""
+    if first_touch:
+        first_touch_cls = _DETERMINISTIC_FIRST_TOUCH_RELAY_KERNELS.get(relay_cluster_size)
+        if first_touch_cls is None or first_touch_cls.num_dkv_shards != num_shards:
+            raise ValueError("first-touch dKV stores are supported only by the wide cluster-4 relay, " f"got {num_shards} planes with cluster size {relay_cluster_size}")
+        return first_touch_cls
     if relay_cluster_size == 1:
         return _deterministic_kernel_class_for_shards(num_shards)
     try:

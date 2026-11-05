@@ -402,6 +402,7 @@ class SparseAttentionBackward(APIBase):
                     shards,
                     relay_cluster_size,
                     self._wide_addressing,
+                    bool(getattr(kernel_cls, "dkv_first_touch_store", False)),
                 )
             return
         if self._device_major == 10:
