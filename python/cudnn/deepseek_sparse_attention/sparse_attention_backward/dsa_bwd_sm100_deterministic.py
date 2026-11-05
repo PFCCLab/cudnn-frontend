@@ -288,26 +288,41 @@ class _DeterministicReductionPolicy:
         dSink: cute.Tensor,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Tuple[Int32, Int32], Int32]],
     ):
-        """Reduce each head's dSink across queries in a fixed thread order."""
+        """Reduce each head's dSink across queries in a fixed three-level order.
+
+        Lanes sum strided terms inside each 256-query block, the warp tree-reduces
+        the block, and block partials are spread round-robin over lanes before a
+        final warp tree. Serial FP32 chains stay short (8 + SQ/8192 terms) instead
+        of SQ/32, so the result is closer to the exact sum than the official
+        single-chain order while every add keeps a fixed position.
+        """
         _, head_idx, batch_idx = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
-        q_idx = tidx
         log2_e = Float32(math.log2(math.e))
         sink_log2 = attn_sink[head_idx, (0, batch_idx)] * log2_e
-        acc = Float32(0.0)
-        while q_idx < problem_shape[0]:
-            p_sink = Float32(0.0)
-            if sink_log2 == Float32(float("inf")):
-                p_sink = Float32(1.0)
-            elif sink_log2 == Float32(float("-inf")):
+        seqlen_q = problem_shape[0]
+        outer = Float32(0.0)
+        num_blocks = cute.ceil_div(seqlen_q, self.dSink_block_q)
+        for blk in cutlass.range(num_blocks, unroll=1):
+            q_end = min(seqlen_q, (blk + 1) * self.dSink_block_q)
+            q_idx = blk * self.dSink_block_q + tidx
+            acc = Float32(0.0)
+            while q_idx < q_end:
                 p_sink = Float32(0.0)
-            else:
-                p_sink = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx, batch_idx)])
-            acc += p_sink * sum_OdO[head_idx, (q_idx, batch_idx)]
-            q_idx += self.dSink_num_threads
-        acc = cute.arch.warp_reduction_sum(acc, threads_in_group=self.dSink_num_threads)
+                if sink_log2 == Float32(float("inf")):
+                    p_sink = Float32(1.0)
+                elif sink_log2 == Float32(float("-inf")):
+                    p_sink = Float32(0.0)
+                else:
+                    p_sink = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx, batch_idx)])
+                acc += p_sink * sum_OdO[head_idx, (q_idx, batch_idx)]
+                q_idx += self.dSink_num_threads
+            acc = cute.arch.warp_reduction_sum(acc, threads_in_group=self.dSink_num_threads)
+            if blk % self.dSink_num_threads == tidx:
+                outer += acc
+        outer = cute.arch.warp_reduction_sum(outer, threads_in_group=self.dSink_num_threads)
         if tidx == 0:
-            dSink[head_idx, (0, batch_idx)] = acc
+            dSink[head_idx, (0, batch_idx)] = outer
 
 
 class FlashAttentionDSABackwardSm100Deterministic(_DeterministicReductionPolicy, FlashAttentionDSABackwardSm100):
