@@ -905,6 +905,13 @@ def deterministic_kernel_class(
             return _automatic_relay_kernel(total_seqlen_q, total_seqlen_kv, head_dim, num_heads, relay_width)
         if deterministic_relay_cluster_size is not None:
             raise ValueError("deterministic_relay_cluster_size is valid only when the deterministic large-context relay is selected")
+        if total_seqlen_q >= _CLUSTER4_MIN_Q:
+            # Long query batches that fit the 128-shard cap still prefer the
+            # wide relay when available: it is no slower and keeps 36 planes
+            # instead of 128 shards.
+            wide_cls = _automatic_relay_kernel(total_seqlen_q, total_seqlen_kv, head_dim, num_heads, 4)
+            if wide_cls is _DETERMINISTIC_WIDE_RELAY_KERNELS[4]:
+                return wide_cls
     elif deterministic_relay_cluster_size is not None:
         raise ValueError("deterministic_relay_cluster_size requires total_seqlen_kv and head_dim")
     return _DETERMINISTIC_KERNELS[deterministic_dkv_shards(total_seqlen_q)]

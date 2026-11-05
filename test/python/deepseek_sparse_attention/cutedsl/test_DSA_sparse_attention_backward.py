@@ -964,9 +964,16 @@ def test_DSA_sparse_attention_backward_deterministic_wide_relay_policy(monkeypat
     assert det_module.deterministic_kernel_class(16384, 453432, 576) is cluster4
     assert det_module._deterministic_kernel_class_for_config(36, 4) is wide
     assert det_module._deterministic_kernel_class_for_config(32, 4) is cluster4
+    # Long query batches below the 128-shard cap also take the wide relay;
+    # shorter ones keep the bounded-wave shards.
+    assert not det_module.use_cluster_dkv_relay(16384, 16384, 576)
+    assert det_module.deterministic_kernel_class(16384, 16384, 576) is wide
+    assert det_module.deterministic_kernel_class(8192, 4096, 512) is wide
+    assert det_module.deterministic_kernel_class(8191, 16384, 576) is det_module.FlashAttentionDSABackwardSm100Deterministic
 
     monkeypatch.setattr(det_module, "_current_device_supports_wide_relay", lambda wave_ctas: False)
     assert det_module.deterministic_kernel_class(16384, 278528, 576) is cluster4
+    assert det_module.deterministic_kernel_class(16384, 16384, 576) is det_module.FlashAttentionDSABackwardSm100Deterministic
 
 
 @pytest.mark.L0
