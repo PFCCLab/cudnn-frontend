@@ -365,6 +365,7 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
     run_dkv_prefold = True
     dkv_mask_dtype = Uint32
     dkv_mask_word_bits = 32
+    plane_major_convert = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -636,6 +637,34 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
                     acc += mdKV_acc[dim_idx, row_idx, (0, 0)]
                 mdKV_acc[dim_idx, seq_id + group_begin * physical_rows, (0, 0)] = acc
 
+    @cute.jit
+    def _convert_plane_major(self, mdKV_acc: cute.Tensor, mdKV: cute.Tensor, seq_id: Int32, batch_idx: Int32, tidx: Int32, physical_rows: Int32):
+        """Same per-element FP32 order as the plane loop below, but planes are the outer loop.
+
+        Every thread keeps all of its row elements in registers and issues one
+        independent load per element for each plane, so a warp has a whole
+        plane row in flight instead of one element's plane chain.
+        """
+        num_128_tiles = self.head_dim_main // 64
+        cols = [(j, i) for i in range(num_128_tiles) for j in range(2)]
+        if cutlass.const_expr(not self.same_hdim_kv):
+            cols += [(j, num_128_tiles) for j in range(2)]
+        accs = [Float32(0.0) for _ in cols]
+        for group_idx in cutlass.range_constexpr(self.num_dkv_final_terms):
+            shard_idx = group_idx * self.dkv_final_stride
+            row = mdKV_acc[None, seq_id + shard_idx * physical_rows, (0, batch_idx)]
+            tile = cute.flat_divide(cute.flat_divide(row, (64,)), (32,))
+            vals = [tile[tidx, j, i] for (j, i) in cols]
+            accs = [a + v for a, v in zip(accs, vals)]
+        cur_mdKV_row = mdKV[None, seq_id, (0, batch_idx)]
+        for n, (j, i) in enumerate(cols):
+            if cutlass.const_expr(i < num_128_tiles):
+                dim_idx = tidx // 4 + tidx % 4 * 8 + j * 32 + i * 64
+            else:
+                k = tidx // 2 + j * 16
+                dim_idx = self.head_dim_main + (k // 8) * 16 + k % 8 + (tidx % 2) * 8
+            cur_mdKV_row[dim_idx] = self.element_dtype(accs[n])
+
     @cute.kernel
     def convert(
         self,
@@ -648,7 +677,10 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         seq_block_idx, _, batch_idx = cute.arch.block_idx()
         seq_id = self.block_seq * seq_block_idx + tidy
         physical_rows = self._physical_rows_per_plane(mdKV_acc)
-        if seq_id < seqlen:
+        if cutlass.const_expr(self.plane_major_convert):
+            if seq_id < seqlen:
+                self._convert_plane_major(mdKV_acc, mdKV, seq_id, batch_idx, tidx, physical_rows)
+        elif seq_id < seqlen:
             cur_mdKV_row = mdKV[None, seq_id, (0, batch_idx)]
             num_128_tiles = self.head_dim_main // 64
             for i in cutlass.range(num_128_tiles, unroll_full=True):
