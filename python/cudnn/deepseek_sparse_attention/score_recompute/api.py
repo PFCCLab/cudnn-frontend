@@ -19,6 +19,7 @@ import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
 
+from . import _interface_sm90 as _iface_sm90
 from . import _interface_sm100 as _iface_sm100
 
 # ---------------------------------------------------------------------------
@@ -191,8 +192,6 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
     ) -> torch.Tensor:
         major, _ = torch.cuda.get_device_capability()
         if major == 9:
-            from . import _interface_sm90 as _iface_sm90
-
             return _iface_sm90.sparse_indexer_score_recompute(
                 q_indexer,
                 k_indexer,
@@ -359,8 +358,6 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
         scale = self.softmax_scale if softmax_scale is None else float(softmax_scale)
         major, _ = torch.cuda.get_device_capability()
         if major == 9:
-            from . import _interface_sm90 as _iface_sm90
-
             return _iface_sm90.sparse_attn_score_recompute(
                 q_attn,
                 k_attn,
@@ -575,8 +572,6 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
                 max_seqlen_k = _max_from_cu_seqlens(cu_seqlens_k, "cu_seqlens_k")
         major, _ = torch.cuda.get_device_capability()
         if major == 9:
-            from . import _interface_sm90 as _iface_sm90
-
             return _iface_sm90.dense_indexer_score_recompute(
                 q,
                 k,
@@ -820,8 +815,6 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
                 max_seqlen_k = _max_from_cu_seqlens(cu_seqlens_k, "cu_seqlens_k")
         major, _ = torch.cuda.get_device_capability()
         if major == 9:
-            from . import _interface_sm90 as _iface_sm90
-
             return _iface_sm90.dense_attn_score_recompute(
                 q,
                 k,
