@@ -113,8 +113,9 @@ def _relay_workspace_bytes(
     cluster_size: int,
     wave_ctas: int = _RELAY_WAVE_CTAS,
     first_touch: bool = False,
+    ticket: bool = False,
 ) -> int:
-    """Return the complete FP32-plane, packed-mask, and first-owner relay allocation."""
+    """Return the complete FP32-plane, packed-mask, first-owner, and ticket relay allocation."""
     k = (int(total_seqlen_kv) + 7) // 8 * 8
     d = (int(head_dim) + 7) // 8 * 8
     num_planes = wave_ctas // cluster_size
@@ -126,7 +127,9 @@ def _relay_workspace_bytes(
     mask_elements = mask_words * (mask_word_bits // 32)
     mask_rows = (mask_elements + d - 1) // d
     owner_rows = (k + d - 1) // d if first_touch else 0
-    return num_planes * (k + mask_rows + owner_rows) * d * 4
+    ticket_words = num_head_blocks * ((int(total_seqlen_q) + cluster_size - 1) // cluster_size + 1)
+    ticket_rows = (ticket_words + d - 1) // d if ticket else 0
+    return num_planes * (k + mask_rows + owner_rows + ticket_rows) * d * 4
 
 
 def deterministic_dkv_relay_cluster_size(total_seqlen_q: int, total_seqlen_kv: int, head_dim: int, num_heads: int = 64) -> int:
@@ -935,6 +938,81 @@ class FlashAttentionDSABackwardSm100DeterministicCluster4WideFirstTouch(FlashAtt
     dkv_first_touch_store = True
 
 
+class FlashAttentionDSABackwardSm100DeterministicCluster4WideTicket(FlashAttentionDSABackwardSm100DeterministicCluster4Wide):
+    """Wide relay as one launch of every query CTA, ordered by tickets.
+
+    A CTA takes its token from a counter, so tokens start in ticket order and
+    the lower tokens a CTA waits on are already running. Plane p is reused
+    every wave; before reducing, a token waits until all four tokens of the
+    previous wave's group on plane p have finished. Masks, owners and the
+    per-row accumulation order are those of the waved relay.
+    """
+
+    dkv_cooperative_relay = False
+    dkv_ticket_relay = True
+
+    @classmethod
+    def _ticket_words(cls, q: int, h: int) -> int:
+        return ((h + 63) // 64) * ((q + cls.dkv_relay_cluster_size - 1) // cls.dkv_relay_cluster_size + 1)
+
+    @classmethod
+    def _get_workspace_size_dKV_for_q(cls, q: int, k: int, d: int, h: int, b: int, acc_dtype: Type[cutlass.Numeric]):
+        """Reserve the ticket counter and per-group finish counts before the owner rows."""
+        b_, shards, rows, row_bytes = super()._get_workspace_size_dKV_for_q(q, k, d, h, b, acc_dtype)
+        d = (d + 7) // 8 * 8
+        return (b_, shards, rows + (cls._ticket_words(q, h) + d - 1) // d, row_bytes)
+
+    @cute.jit
+    def _ticket_word_ptr(self, mdKV_acc: cute.Tensor, problem_shape, head_block_idx: Int32, word: Int32):
+        """Plane 0 tail: per head block, [counter, finish count of group 0, 1, ...]."""
+        physical_rows = self._physical_rows_per_plane(mdKV_acc)
+        owner_rows = 0
+        if cutlass.const_expr(self.dkv_first_touch_store):
+            owner_rows = cute.ceil_div(cute.round_up(problem_shape[1], 8), self.head_dim)
+        stride = cute.ceil_div(problem_shape[0], self.dkv_relay_cluster_size) + 1
+        num_head_blocks = cute.ceil_div(problem_shape[3][0], self.block_tile)
+        ticket_rows = cute.ceil_div(num_head_blocks * stride, self.head_dim)
+        base = Int64(physical_rows - owner_rows - ticket_rows) * Int64(self.head_dim)
+        return cute.recast_ptr(mdKV_acc.iterator, dtype=Int32) + base + Int64(head_block_idx * stride + word)
+
+    @cute.jit
+    def dKV_take_ticket(self, mdKV_acc: cute.Tensor, problem_shape, head_block_idx: Int32) -> Int32:
+        ptr = self._ticket_word_ptr(mdKV_acc, problem_shape, head_block_idx, Int32(0))
+        return cute.arch.atomic_add(ptr.llvm_ptr, Int32(1), sem="relaxed", scope="gpu")
+
+    @cute.jit
+    def dKV_wait_ticket_window(self, mdKV_acc: cute.Tensor, problem_shape, token_idx: Int32, head_block_idx: Int32):
+        """Acquire the previous wave's group on this token's plane."""
+        groups_per_wave = self.q_wave_ctas // self.dkv_relay_cluster_size
+        prev_group = token_idx // self.dkv_relay_cluster_size - groups_per_wave
+        if prev_group >= 0:
+            ptr = self._ticket_word_ptr(mdKV_acc, problem_shape, head_block_idx, prev_group + 1)
+            full = Int32(self.dkv_relay_cluster_size)
+            current = cute.arch.load(ptr, Int32, sem="relaxed", scope="gpu")
+            loop = cutlass.while_generate([current], lambda value: value != full)
+            with loop as [value]:
+                value = cute.arch.load(ptr, Int32, sem="relaxed", scope="gpu")
+                cutlass.yield_out([value])
+            acquired = cute.arch.load(ptr, Int32, sem="acquire", scope="gpu")
+            acquire_loop = cutlass.while_generate([acquired], lambda value: value != full)
+            with acquire_loop as [value]:
+                value = cute.arch.load(ptr, Int32, sem="acquire", scope="gpu")
+                cutlass.yield_out([value])
+
+    @cute.jit
+    def dKV_finish_ticket(self, mdKV_acc: cute.Tensor, problem_shape, token_idx: Int32, head_block_idx: Int32):
+        """Release this token's plane updates to the next wave's group."""
+        group = token_idx // self.dkv_relay_cluster_size
+        ptr = self._ticket_word_ptr(mdKV_acc, problem_shape, head_block_idx, group + 1)
+        cute.arch.atomic_add(ptr.llvm_ptr, Int32(1), sem="release", scope="gpu")
+
+
+class FlashAttentionDSABackwardSm100DeterministicCluster4WideFirstTouchTicket(FlashAttentionDSABackwardSm100DeterministicCluster4WideTicket):
+    """Ticket-ordered wide relay with first-touch stores."""
+
+    dkv_first_touch_store = True
+
+
 _DETERMINISTIC_KERNELS = {
     32: FlashAttentionDSABackwardSm100Deterministic32,
     64: FlashAttentionDSABackwardSm100Deterministic64,
@@ -951,12 +1029,13 @@ _DETERMINISTIC_RELAY_KERNELS = {
 
 # Automatic cluster-4 plans use the cooperative wide wave when the current
 # device can co-schedule it; explicit cluster-size overrides keep the
-# hardware-cluster layout.
+# hardware-cluster layout. The ticket variants run every wave in one launch
+# and are bit-identical to the waved Cluster4Wide/Cluster4WideFirstTouch.
 _DETERMINISTIC_WIDE_RELAY_KERNELS = {
-    4: FlashAttentionDSABackwardSm100DeterministicCluster4Wide,
+    4: FlashAttentionDSABackwardSm100DeterministicCluster4WideTicket,
 }
 _DETERMINISTIC_FIRST_TOUCH_RELAY_KERNELS = {
-    4: FlashAttentionDSABackwardSm100DeterministicCluster4WideFirstTouch,
+    4: FlashAttentionDSABackwardSm100DeterministicCluster4WideFirstTouchTicket,
 }
 
 
@@ -976,9 +1055,10 @@ def _current_device_supports_wide_relay(wave_ctas: int) -> bool:
 def _automatic_relay_kernel(total_seqlen_q: int, total_seqlen_kv: int, head_dim: int, num_heads: int, relay_width: int):
     """Prefer the wide cooperative wave for automatic plans that fit the budget."""
     wide_cls = _DETERMINISTIC_WIDE_RELAY_KERNELS.get(relay_width)
+    ticket = bool(getattr(wide_cls, "dkv_ticket_relay", False))
     if (
         wide_cls is not None
-        and _relay_workspace_bytes(total_seqlen_q, total_seqlen_kv, head_dim, num_heads, relay_width, wide_cls.q_wave_ctas)
+        and _relay_workspace_bytes(total_seqlen_q, total_seqlen_kv, head_dim, num_heads, relay_width, wide_cls.q_wave_ctas, False, ticket)
         <= _RELAY_WORKSPACE_BUDGET_BYTES
         and _current_device_supports_wide_relay(wide_cls.q_wave_ctas)
     ):
@@ -986,7 +1066,10 @@ def _automatic_relay_kernel(total_seqlen_q: int, total_seqlen_kv: int, head_dim:
         if (
             first_touch_cls is not None
             and total_seqlen_kv >= _FIRST_TOUCH_MIN_KV_PER_Q * total_seqlen_q
-            and _relay_workspace_bytes(total_seqlen_q, total_seqlen_kv, head_dim, num_heads, relay_width, first_touch_cls.q_wave_ctas, True)
+            and _relay_workspace_bytes(
+                total_seqlen_q, total_seqlen_kv, head_dim, num_heads, relay_width, first_touch_cls.q_wave_ctas, True,
+                bool(getattr(first_touch_cls, "dkv_ticket_relay", False)),
+            )
             <= _RELAY_WORKSPACE_BUDGET_BYTES
         ):
             return first_touch_cls

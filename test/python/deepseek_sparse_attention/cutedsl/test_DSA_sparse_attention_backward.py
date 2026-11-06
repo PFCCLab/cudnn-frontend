@@ -960,6 +960,21 @@ def test_DSA_sparse_attention_backward_deterministic_wide_relay_policy(monkeypat
     # First-touch adds one owner word per KV row to each plane.
     assert ft_shape[2] - dkv_shape[2] == math.ceil(278528 / 576)
 
+    # Automatic plans use the single-launch ticket variants of both classes.
+    wide_t = det_module.FlashAttentionDSABackwardSm100DeterministicCluster4WideTicket
+    ft_t = det_module.FlashAttentionDSABackwardSm100DeterministicCluster4WideFirstTouchTicket
+    assert issubclass(wide_t, wide) and issubclass(ft_t, wide_t)
+    assert wide_t.dkv_ticket_relay and ft_t.dkv_ticket_relay and not wide.dkv_ticket_relay
+    assert not wide_t.dkv_cooperative_relay and ft_t.dkv_first_touch_store and not wide_t.dkv_first_touch_store
+    assert det_module._DETERMINISTIC_WIDE_RELAY_KERNELS[4] is wide_t
+    assert det_module._DETERMINISTIC_FIRST_TOUCH_RELAY_KERNELS[4] is ft_t
+    for cls, ft in ((wide_t, False), (ft_t, True)):
+        shape = cls._get_workspace_size_dKV_for_q(16384, 278528, 576, 64, 1, cutlass.Float32)
+        assert math.prod(shape) == det_module._relay_workspace_bytes(16384, 278528, 576, 64, 4, wide.q_wave_ctas, ft, True)
+    # The ticket counter and per-group finish counts take whole rows after the masks.
+    assert wide_t._get_workspace_size_dKV_for_q(16384, 278528, 576, 64, 1, cutlass.Float32)[2] - dkv_shape[2] == math.ceil((16384 // 4 + 1) / 576)
+    wide, first_touch = wide_t, ft_t
+
     monkeypatch.setattr(det_module, "_current_device_supports_wide_relay", lambda wave_ctas: wave_ctas <= 148)
     # Wide plans with S_kv >= 8 * S_q skip the data-plane clear.
     assert det_module.deterministic_kernel_class(16384, 278528, 576) is first_touch
@@ -1092,7 +1107,9 @@ def test_DSA_sparse_attention_backward_sm100_large_context_workspace_uses_cluste
     mask_rows_per_plane = math.ceil(mask_words_per_plane / head_dim)
     lse_odo_bytes = num_heads * padded_q * 2 * torch.float32.itemsize
     owner_rows_per_plane = math.ceil(padded_kv / head_dim) if kernel_cls.dkv_first_touch_store else 0
-    dkv_bytes = kernel_cls.num_dkv_shards * (padded_kv + mask_rows_per_plane + owner_rows_per_plane) * head_dim * torch.float32.itemsize
+    ticket_words = num_head_blocks * (math.ceil(s_q / kernel_cls.dkv_relay_cluster_size) + 1)
+    ticket_rows_per_plane = math.ceil(ticket_words / head_dim) if getattr(kernel_cls, "dkv_ticket_relay", False) else 0
+    dkv_bytes = kernel_cls.num_dkv_shards * (padded_kv + mask_rows_per_plane + owner_rows_per_plane + ticket_rows_per_plane) * head_dim * torch.float32.itemsize
     assert interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64") == lse_odo_bytes + dkv_bytes
 
 

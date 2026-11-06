@@ -59,6 +59,12 @@ class FlashAttentionDSABackwardSm100:
     # dKV_first_touch_owner_words()/dKV_first_touch_flag() and must leave
     # untouched rows out of its fold.
     dkv_first_touch_store = False
+    # Launch every query CTA at once and let each CTA take its token from a
+    # ticket counter, so tokens start in ticket order and a CTA only ever waits
+    # on lower tickets. The policy supplies dKV_take_ticket(),
+    # dKV_wait_ticket_window() and dKV_finish_ticket(), and its acquire must
+    # also order a row after the previous wave.
+    dkv_ticket_relay = False
 
     def __init__(
         self,
@@ -637,6 +643,7 @@ class FlashAttentionDSABackwardSm100:
             compute_mma_dS_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.compute_mma_dS_stage * 2]
             mma_reduce_dKV_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_reduce_dKV_stage * 2]
             tmem_holding_buf: cutlass.Int32
+            ticket_buf: cutlass.Int32
             sQ: cute.struct.Align[
                 cute.struct.MemRange[self.element_dtype, cute.cosize(Q_smem_layout_staged)],
                 self.buffer_align_bytes,
@@ -709,10 +716,11 @@ class FlashAttentionDSABackwardSm100:
             return
 
         num_head_blocks = cute.ceil_div(bwd_problem_shape[3][0], self.block_tile)
-        q_wave_size = self.q_wave_ctas if cutlass.const_expr(self.q_wave_ctas > 0) else problem_shape[0]
+        q_wave_size = self.q_wave_ctas if cutlass.const_expr(self.q_wave_ctas > 0 and not self.dkv_ticket_relay) else problem_shape[0]
         if cutlass.const_expr(self.q_wave_ctas > 0):
             assert self.q_wave_ctas % self.dkv_relay_phases == 0
-            if cutlass.const_expr(self.dkv_cooperative_relay):
+            if cutlass.const_expr(self.dkv_cooperative_relay or self.dkv_ticket_relay):
+                assert not (self.dkv_cooperative_relay and self.dkv_ticket_relay)
                 assert self.dkv_relay_phases == 1 and self.q_wave_ctas % self.dkv_relay_cluster_size == 0
             else:
                 assert self.dkv_relay_cluster_size == self.dkv_cluster_shape[0] * self.dkv_relay_phases
@@ -777,7 +785,7 @@ class FlashAttentionDSABackwardSm100:
                     ).launch(
                         grid=(q_launch_size, head_blocks_per_launch, bwd_problem_shape[3][1]),
                         block=[self.threads_per_cta, 1, 1],
-                        cluster=(1, 1, 1) if cutlass.const_expr(self.dkv_cooperative_relay) else self.dkv_cluster_shape,
+                        cluster=(1, 1, 1) if cutlass.const_expr(self.dkv_cooperative_relay or self.dkv_ticket_relay) else self.dkv_cluster_shape,
                         smem=self.shared_storage.size_in_bytes(),
                         stream=stream,
                         min_blocks_per_mp=1,
@@ -992,7 +1000,7 @@ class FlashAttentionDSABackwardSm100:
         token_idx = wave_idx
         if cutlass.const_expr(self.serialize_head_blocks):
             head_block_idx += head_block_offset
-        if cutlass.const_expr(self.q_wave_ctas > 0 and self.dkv_cooperative_relay):
+        if cutlass.const_expr(self.q_wave_ctas > 0 and (self.dkv_cooperative_relay or self.dkv_ticket_relay)):
             token_idx = q_offset + wave_idx
         elif cutlass.const_expr(self.q_wave_ctas > 0):
             physical_cluster_size = self.dkv_cluster_shape[0]
@@ -1003,6 +1011,16 @@ class FlashAttentionDSABackwardSm100:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         max_seqlen_q, max_seqlen_kv, head_dim, (num_heads, batch_size) = problem_shape
+
+        if cutlass.const_expr(self.dkv_ticket_relay):
+            # Tickets follow CTA start order, so every lower ticket is already
+            # running and a CTA's waits on lower tokens always make progress.
+            storage = SmemAllocator().allocate(self.shared_storage)
+            sTicket = cute.make_tensor(storage.ticket_buf.ptr, cute.make_layout(1))
+            if tidx == 0:
+                sTicket[0] = self.dKV_take_ticket(mdKV_acc, problem_shape, head_block_idx)
+            cute.arch.barrier()
+            token_idx = cute.arch.make_warp_uniform(sTicket[0])
 
         # Only deterministic waves pad the last launch. Compile this guard out
         # of the ordinary single-launch kernel, where every token is in range.
@@ -1029,6 +1047,11 @@ class FlashAttentionDSABackwardSm100:
                     head_idx = head_block_idx * self.block_tile + head_offset
                     if head_idx < num_heads:
                         mdQ[dim_idx, head_idx, (token_idx, batch_idx)] = mdQ.element_type(0.0)
+            if cutlass.const_expr(self.dkv_ticket_relay):
+                # An empty token still passes on the previous wave's ordering.
+                if tidx == 0:
+                    self.dKV_wait_ticket_window(mdKV_acc, problem_shape, token_idx, head_block_idx)
+                    self.dKV_finish_ticket(mdKV_acc, problem_shape, token_idx, head_block_idx)
             cute.arch.nvvm.exit()
 
         if warp_idx == self.load_warp_id:
@@ -1036,8 +1059,8 @@ class FlashAttentionDSABackwardSm100:
             cpasync.prefetch_descriptor(tma_atom_dO)
             cpasync.prefetch_descriptor(tma_atom_dQ)
 
-        smem = SmemAllocator()
-        storage = smem.allocate(self.shared_storage)
+        if cutlass.const_expr(not self.dkv_ticket_relay):
+            storage = SmemAllocator().allocate(self.shared_storage)
 
         load_mma_QdO_pipeline = self.make_and_init_load_mma_QdO_pipeline(
             storage.load_mma_QdO_mbar_ptr.data_ptr(),
@@ -1307,6 +1330,12 @@ class FlashAttentionDSABackwardSm100:
                 QK_tiled_mma, dOV_tiled_mma, QdS_tiled_mma, KdS_tiled_mma, dKV4_tiled_mma, dQ4_tiled_mma, tmem_ptr_base
             )
 
+            reduce_tidx0 = self.reduce_warp_id[0] * self.threads_per_warp
+            if cutlass.const_expr(self.dkv_ticket_relay):
+                # Order this token's plane rows after the previous wave's.
+                if tidx == reduce_tidx0:
+                    self.dKV_wait_ticket_window(mdKV_acc, problem_shape, token_idx, head_block_idx)
+                _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
             self.reduce_dKV(
                 (tdKVtdKV0, tdKVtdKV1, tdKVtdKV2, tdKVtdKV3, tdKVtdKV4),
                 mdKV_acc,
@@ -1319,6 +1348,10 @@ class FlashAttentionDSABackwardSm100:
                 problem_shape,
                 mma_reduce_dKV_pipeline,
             )
+            if cutlass.const_expr(self.dkv_ticket_relay):
+                _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
+                if tidx == reduce_tidx0:
+                    self.dKV_finish_ticket(mdKV_acc, problem_shape, token_idx, head_block_idx)
             # All T2R reads issued by this warp are complete here (each T2R
             # generation fences before its pipeline release);
             # signal compute warp 0 that TMEM dealloc is now safe.
