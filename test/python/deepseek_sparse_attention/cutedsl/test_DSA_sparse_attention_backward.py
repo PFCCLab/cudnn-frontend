@@ -966,13 +966,17 @@ def test_DSA_sparse_attention_backward_deterministic_wide_relay_policy(monkeypat
     assert issubclass(wide_t, wide) and issubclass(ft_t, wide_t)
     assert wide_t.dkv_ticket_relay and ft_t.dkv_ticket_relay and not wide.dkv_ticket_relay
     assert not wide_t.dkv_cooperative_relay and ft_t.dkv_first_touch_store and not wide_t.dkv_first_touch_store
+    # The ticket relay cycles 40 planes; it needs no co-residency, so 160 may exceed the SM count.
+    assert wide_t.q_wave_ctas == ft_t.q_wave_ctas == 160
+    assert wide_t.num_dkv_shards == ft_t.num_dkv_shards == wide_t.num_dkv_final_terms == 40
     assert det_module._DETERMINISTIC_WIDE_RELAY_KERNELS[4] is wide_t
     assert det_module._DETERMINISTIC_FIRST_TOUCH_RELAY_KERNELS[4] is ft_t
     for cls, ft in ((wide_t, False), (ft_t, True)):
         shape = cls._get_workspace_size_dKV_for_q(16384, 278528, 576, 64, 1, cutlass.Float32)
-        assert math.prod(shape) == det_module._relay_workspace_bytes(16384, 278528, 576, 64, 4, wide.q_wave_ctas, ft, True)
-    # The ticket counter and per-group finish counts take whole rows after the masks.
-    assert wide_t._get_workspace_size_dKV_for_q(16384, 278528, 576, 64, 1, cutlass.Float32)[2] - dkv_shape[2] == math.ceil((16384 // 4 + 1) / 576)
+        assert math.prod(shape) == det_module._relay_workspace_bytes(16384, 278528, 576, 64, 4, cls.q_wave_ctas, ft, True)
+    # The ticket counter and per-group finish counts take whole rows of every plane.
+    ticket_bytes = det_module._relay_workspace_bytes(16384, 278528, 576, 64, 4, 160, False, True) - det_module._relay_workspace_bytes(16384, 278528, 576, 64, 4, 160)
+    assert ticket_bytes == 40 * math.ceil((16384 // 4 + 1) / 576) * 576 * 4
     wide, first_touch = wide_t, ft_t
 
     monkeypatch.setattr(det_module, "_current_device_supports_wide_relay", lambda wave_ctas: wave_ctas <= 148)
@@ -990,9 +994,9 @@ def test_DSA_sparse_attention_backward_deterministic_wide_relay_policy(monkeypat
     # At the cluster-4 budget edge the wider plane set no longer fits; keep 32 planes.
     assert det_module._relay_workspace_bytes(16384, 453432, 576, 64, 4, wide.q_wave_ctas) > det_module._RELAY_WORKSPACE_BUDGET_BYTES
     assert det_module.deterministic_kernel_class(16384, 453432, 576) is cluster4
-    assert det_module._deterministic_kernel_class_for_config(36, 4) is wide
+    assert det_module._deterministic_kernel_class_for_config(40, 4) is wide
     assert det_module._deterministic_kernel_class_for_config(32, 4) is cluster4
-    assert det_module._deterministic_kernel_class_for_config(36, 4, True) is first_touch
+    assert det_module._deterministic_kernel_class_for_config(40, 4, True) is first_touch
     with pytest.raises(ValueError, match="first-touch"):
         det_module._deterministic_kernel_class_for_config(32, 4, True)
     # Long query batches below the 128-shard cap also take the wide relay;

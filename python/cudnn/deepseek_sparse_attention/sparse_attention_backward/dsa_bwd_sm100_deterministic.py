@@ -25,6 +25,11 @@ _RELAY_WAVE_CTAS = 128
 # 32 hardware clusters (128 CTAs) that stay resident to 36 four-CTA relay
 # groups. It must not exceed the device SM count (one CTA per SM).
 _RELAY_WIDE_WAVE_CTAS = 144
+# Plane cycle of the ticket relay (40 planes). A ticket token waits only for
+# earlier tickets, so the cycle may exceed the SM count; the planes beyond the
+# resident CTAs give later tokens slack while the previous same-plane group
+# finishes its last rank (B300: 160 is 1.6-3.6% faster than 144, 192 no faster).
+_RELAY_TICKET_WAVE_CTAS = 160
 _CLUSTER4_MIN_Q = 8192
 # Wide relays switch to first-touch stores once S_kv >= 8 * S_q. Skipping the
 # data-plane clear saves bandwidth proportional to S_kv, while the store branch
@@ -943,11 +948,15 @@ class FlashAttentionDSABackwardSm100DeterministicCluster4WideTicket(FlashAttenti
 
     A CTA takes its token from a counter, so tokens start in ticket order and
     the lower tokens a CTA waits on are already running. Plane p is reused
-    every wave; before reducing, a token waits until all four tokens of the
-    previous wave's group on plane p have finished. Masks, owners and the
-    per-row accumulation order are those of the waved relay.
+    every 160 tokens; before reducing, a token waits until all four tokens of
+    the previous group on plane p have finished. Masks, owners and the per-row
+    accumulation order follow the waved relay with a 160-token wave (40 planes).
     """
 
+    q_wave_ctas = _RELAY_TICKET_WAVE_CTAS
+    num_dkv_shards = q_wave_ctas // FlashAttentionDSABackwardSm100DeterministicCluster4.dkv_relay_cluster_size
+    num_dkv_fold_groups = max(1, num_dkv_shards // _FlashAttentionDSABackwardSm100DeterministicRelay.dkv_fold_group_size)
+    num_dkv_final_terms = num_dkv_shards
     dkv_cooperative_relay = False
     dkv_ticket_relay = True
 
@@ -1029,8 +1038,8 @@ _DETERMINISTIC_RELAY_KERNELS = {
 
 # Automatic cluster-4 plans use the cooperative wide wave when the current
 # device can co-schedule it; explicit cluster-size overrides keep the
-# hardware-cluster layout. The ticket variants run every wave in one launch
-# and are bit-identical to the waved Cluster4Wide/Cluster4WideFirstTouch.
+# hardware-cluster layout. The ticket variants run every query CTA in one
+# launch over 40 planes and need no co-residency.
 _DETERMINISTIC_WIDE_RELAY_KERNELS = {
     4: FlashAttentionDSABackwardSm100DeterministicCluster4WideTicket,
 }
@@ -1060,7 +1069,7 @@ def _automatic_relay_kernel(total_seqlen_q: int, total_seqlen_kv: int, head_dim:
         wide_cls is not None
         and _relay_workspace_bytes(total_seqlen_q, total_seqlen_kv, head_dim, num_heads, relay_width, wide_cls.q_wave_ctas, False, ticket)
         <= _RELAY_WORKSPACE_BUDGET_BYTES
-        and _current_device_supports_wide_relay(wide_cls.q_wave_ctas)
+        and _current_device_supports_wide_relay(wide_cls.q_wave_ctas if wide_cls.dkv_cooperative_relay else 1)
     ):
         first_touch_cls = _DETERMINISTIC_FIRST_TOUCH_RELAY_KERNELS.get(relay_width)
         if (
@@ -1108,7 +1117,7 @@ def deterministic_kernel_class(
             raise ValueError("deterministic_relay_cluster_size is valid only when the deterministic large-context relay is selected")
         if total_seqlen_q >= _CLUSTER4_MIN_Q:
             # Long query batches that fit the 128-shard cap still prefer the
-            # wide relay when available: it is no slower and keeps 36 planes
+            # wide relay when available: it is no slower and keeps 36-40 planes
             # instead of 128 shards.
             wide_cls = _automatic_relay_kernel(total_seqlen_q, total_seqlen_kv, head_dim, num_heads, 4)
             if issubclass(wide_cls, _DETERMINISTIC_WIDE_RELAY_KERNELS[4]):
