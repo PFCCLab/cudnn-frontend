@@ -20,6 +20,10 @@ from ._interface_sm100_common import (
     _workspace_shapes_sm100,
     flash_attn_bwd_sm100_workspace_size,
 )
+from .dsa_bwd_sm100_h128_d576_2cta import (
+    FlashAttentionDSABackwardSm100H128D576TwoCTA,
+    FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic,
+)
 
 BACKEND = "h128_d576_2cta_m64"
 H96_BACKEND = "h96_d576_2cta_m64"
@@ -72,8 +76,6 @@ def _compile_d576_2cta(
         raise ValueError(f"the H96/H128 D576 two-CTA backend requires an SM100-class device with compute capability in {_BLACKWELL_CAPABILITIES}")
     if num_heads not in (96, 128):
         raise ValueError(f"the D576 two-CTA backend requires 96 or 128 heads, got {num_heads}")
-
-    from .dsa_bwd_sm100_h128_d576_2cta import FlashAttentionDSABackwardSm100H128D576TwoCTA, FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic
 
     sq, skv = cute.sym_int(), cute.sym_int()
 

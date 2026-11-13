@@ -53,10 +53,14 @@ def __getattr__(name):
 
 
 class DSANamespace:
-    def __getattr__(self, name):
-        if name in _SYMBOLS:
-            return _load_symbol(name)
-        raise AttributeError(f"DSA has no attribute {name!r}")
+    # def __getattr__(self, name):
+    #     if name in _SYMBOLS:
+    #         return _load_symbol(name)
+    #     raise AttributeError(f"DSA has no attribute {name!r}")
+    # Make import all symbols eagerly
+    def __init__(self):
+        for symbol in _SYMBOLS:
+            setattr(self, _SYMBOLS[symbol][1], _load_symbol(symbol))
 
 
 DSA = DSANamespace()

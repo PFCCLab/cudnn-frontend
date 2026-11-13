@@ -22,6 +22,15 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     resolve_stream,
     torch_stream_context,
 )
+from cudnn.frost.buffers import (
+    CUTEDSL_MIN_VERSION,
+    cutedsl_arch_requirement_error,
+    cutedsl_requirement_error,
+    cutedsl_state,
+)
+from cudnn.deepseek_sparse_attention.utils.compiler import _ARCH_MAP
+from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
+from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_pack import _launch_pack, _launch_qk_bshd_pack
 
 _ATOM_MN = 128
 _ATOM_K = 4
@@ -141,13 +150,6 @@ def _validate_thd_pack_out(out: torch.Tensor, src: torch.Tensor, *, l_size: int,
 @lru_cache(maxsize=None)
 def _cuda_packer_requirement_error(device_index: int) -> str | None:
     """Return why the CUDA packer is unavailable on ``device_index``."""
-    from cudnn.frost.buffers import (
-        CUTEDSL_MIN_VERSION,
-        cutedsl_arch_requirement_error,
-        cutedsl_requirement_error,
-        cutedsl_state,
-    )
-
     installed, _ = cutedsl_state()
     if not installed:
         floor = ".".join(str(component) for component in CUTEDSL_MIN_VERSION)
@@ -155,9 +157,6 @@ def _cuda_packer_requirement_error(device_index: int) -> str | None:
     requirement_error = cutedsl_requirement_error("SM100 DSA MXFP8/MXFP4 scale packing")
     if requirement_error:
         return requirement_error
-
-    from cudnn.deepseek_sparse_attention.utils.compiler import _ARCH_MAP
-    from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
 
     capability = device_capability(device_index)
     if capability not in _ARCH_MAP:
@@ -193,16 +192,9 @@ def _allocate_pack_out(src: torch.Tensor, shape: tuple[int, int, int], out: torc
 @lru_cache(maxsize=1)
 def _cuda_pack_launchers():
     """Return gated CUDA launchers without repeating import/version work."""
-    from cudnn.frost.buffers import cutedsl_requirement_error
-
     requirement_error = cutedsl_requirement_error("SM100 DSA MXFP8/MXFP4 scale packing")
     if requirement_error:
         raise RuntimeError(requirement_error)
-    from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_pack import (
-        _launch_pack,
-        _launch_qk_bshd_pack,
-    )
-
     return _launch_pack, _launch_qk_bshd_pack
 
 

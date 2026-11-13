@@ -15,9 +15,12 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
+from cudnn._torch_stream import _record_stream as _record_one_stream
 from cudnn._torch_stream import as_torch_stream
 
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
+from .dsa_fwd_sm100_head64 import SparseAttentionForwardSm100Head64
+from .dsa_fwd_sm100_head128_small_topk import SparseAttentionForwardSm100Head128SmallTopKPrefill
 
 _compile_cache: dict = {}
 _ARCH_FLAGS = {
@@ -95,12 +98,8 @@ def _kernel_variant(num_heads: int, head_dim: int) -> str:
 def _make_kernel(variant: str, head_dim: int, indexer_topk: int):
     """Construct one variant behind a narrow adapter for signature changes."""
     if variant == "head64_regular":
-        from .dsa_fwd_sm100_head64 import SparseAttentionForwardSm100Head64
-
         return SparseAttentionForwardSm100Head64(head_dim=head_dim, indexer_topk=indexer_topk)
     if variant == "head128_small_topk_prefill":
-        from .dsa_fwd_sm100_head128_small_topk import SparseAttentionForwardSm100Head128SmallTopKPrefill
-
         return SparseAttentionForwardSm100Head128SmallTopKPrefill(d_qk=head_dim, indexer_topk=indexer_topk)
     raise AssertionError(f"Unknown kernel variant {variant}")
 
@@ -187,7 +186,7 @@ def _contiguous_aligned(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
     # ``contiguous()`` is a no-op for a contiguous storage-offset view.  Force
     # a fresh allocator-backed storage in that case.
     if tensor.data_ptr() % alignment:
-        tensor = tensor.clone(memory_format=torch.contiguous_format)
+        tensor = tensor.clone()  # already dense row-major, so clone() is contiguous (Paddle has no memory_format)
     return tensor
 
 
@@ -195,7 +194,7 @@ def _record_stream(tensors, consumer: torch.cuda.Stream) -> None:
     """Tell PyTorch's allocator that raw kernel pointers live on ``consumer``."""
     for tensor in tensors:
         if tensor is not None:
-            tensor.record_stream(consumer)
+            _record_one_stream(tensor, consumer)
 
 
 def _normalize_and_validate(

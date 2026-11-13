@@ -72,9 +72,21 @@ def _validate_indexer_backward_backend(backend: str) -> None:
 def _validate_grad_loss_tensor(grad_loss: torch.Tensor, device: torch.device) -> torch.Tensor:
     if not torch.is_tensor(grad_loss):
         raise TypeError("grad_loss must be a torch.Tensor")
-    if grad_loss.numel() != 1 or grad_loss.dtype != torch.float32 or grad_loss.device != device:
+    # The element count comes from ``shape`` rather than ``numel()`` so the guard
+    # stays host-side. Under a torch-compat proxy (Paddle's
+    # ``enable_compat(scope={"cudnn"})``, which is how PaddleFleet drives these
+    # kernels) ``numel()`` is an *op* returning a 0-D tensor, so ``!= 1`` builds a
+    # device bool and the Python ``or`` forces ``__bool__`` -> a blocking
+    # device-to-host copy on the legacy default stream. That copy is a
+    # full-device barrier there, and it lands between the caller's loss forward
+    # and this backward, serialising the backward against whatever collective is
+    # in flight. ``shape`` is host metadata under both frameworks.
+    grad_loss_numel = 1
+    for dim in grad_loss.shape:
+        grad_loss_numel *= int(dim)
+    if grad_loss_numel != 1 or grad_loss.dtype != torch.float32 or grad_loss.device != device:
         raise ValueError(f"grad_loss must be a single-element float32 tensor on {device}")
-    return grad_loss.detach().view(1)
+    return grad_loss.detach().reshape([1])
 
 
 def _validate_deterministic_workspace_disjoint(workspace: torch.Tensor, required: int, **operands: torch.Tensor) -> None:
@@ -440,6 +452,13 @@ class IndexerBackward(APIBase):
             self._value_error_if(
                 self.heads != 32 and self.heads < 64,
                 f"the default SM100 IndexerBackward requires H=32 or H>=64, got H={self.heads}",
+            )
+            # block_I=64 hangs on the TMA Gather4 loader and, on the cp.async
+            # loader, returns d_index_k with ~1.4 relative L2 error (dQ / dW stay
+            # correct), so it is rejected rather than run.
+            self._value_error_if(
+                self.block_I != 128,
+                f"the default SM100 IndexerBackward requires block_I=128, got block_I={self.block_I}",
             )
         if self.use_v2:
             b, s_q, s_k = self.batch, self.seqlen, self.seqlen_k
@@ -889,6 +908,20 @@ class DenseIndexerBackward(APIBase):
             ("index_lse", self.idx_lse_desc, denom_shape),
         ):
             self._check_tensor_shape(desc, shape, name=name)
+        # The dK epilogue stages a (block_I, head_dim_padded) FP32 tile in SMEM and
+        # ships it with one cp.reduce.async.bulk of
+        # ``actual_rows * head_dim_padded * 4`` bytes, which silently assumes the
+        # global dK row stride equals head_dim_padded.  On top of that the TMEM
+        # load atom (Ld16x256b, Repetition(8)) only tiles the staging buffer
+        # completely at the widths it was tuned for.  Measured on SM100-class
+        # hardware: head_dim 64 and 128 are correct, 96 / 100 / 112 return
+        # silently wrong d_index_k (relative error up to 4e2, and head_dim=100
+        # also corrupts d_index_q with NaN / 1e38), and 192 / 256 abort with
+        # cudaErrorInvalidValue.  Reject instead of returning bad gradients.
+        self._value_error_if(
+            self.head_dim not in (64, 128),
+            f"DenseIndexerBackward supports head_dim 64 or 128, got {self.head_dim}",
+        )
         self._is_supported = True
         return True
 

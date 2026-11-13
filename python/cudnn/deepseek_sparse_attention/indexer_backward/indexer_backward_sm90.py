@@ -2007,7 +2007,7 @@ def _build_cute_dsl_kernel(
             reduce_deterministic_dk(dIndexK_f32, dIndexK, deterministic_dk_planes, current_stream)
         elif dIndexK_f32 is not dIndexK:
             with _torch_stream_context(current_stream):
-                dIndexK.copy_(dIndexK_f32)
+                dIndexK.copy_(dIndexK_f32.astype(dIndexK.dtype))
 
     _run.score_grad = partial(_score_grad_inplace, index_is_log=score_input_is_log)
     _run.gemm_only = _run_gemm_only

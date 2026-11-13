@@ -10,6 +10,7 @@ import cutlass
 
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 from .dsa_bwd_sm100_deterministic import FlashAttentionDSABackwardSm100Deterministic, deterministic_kernel_class
+from .dsa_bwd_sm100_h128_d576_2cta_deterministic import TwoCTADeterministicReduction
 
 _BLACKWELL_CAPABILITIES = ((10, 0), (10, 3))
 _WORKSPACE_ALIGNMENT = 128
@@ -60,8 +61,6 @@ def _workspace_shapes_sm100(
                 deterministic_relay_cluster_size,
             )
         elif backend in {"h96_d576_2cta_m64", "h128_d576_2cta_m64"}:
-            from .dsa_bwd_sm100_h128_d576_2cta_deterministic import TwoCTADeterministicReduction
-
             dkv_kernel_cls = TwoCTADeterministicReduction
         else:
             dkv_kernel_cls = FlashAttentionDSABackwardSm100Deterministic

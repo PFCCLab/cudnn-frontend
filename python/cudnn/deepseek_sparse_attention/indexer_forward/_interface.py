@@ -46,6 +46,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     validate_q_causal_offsets,
 )
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor as _to_cute_tensor
+from ._compressed_top_k_sm100 import _indexer_fwd_compress_topk_thd, indexer_fwd_compress_topk
 
 # The score kernel binds ``out`` through a 16-byte-aligned dynamic layout, so
 # the fp32 row stride must be a multiple of 4 elements (and cover ceil4(S_k)).
@@ -205,11 +206,6 @@ def indexer_fwd(
             raise ValueError("out is a dense-score buffer and cannot be used with is_compressed_logits=True")
         if kv_stage != 4:
             raise ValueError(f"SM100 compressed indexer forward only supports kv_stage=4, got {kv_stage}")
-        from ._compressed_top_k_sm100 import (
-            _indexer_fwd_compress_topk_thd,
-            indexer_fwd_compress_topk,
-        )
-
         # All eager allocations, copies, both kernel launches, and the optional
         # local-to-global conversion must use the caller-selected stream.
         # The compressed path is a torch-op layer (no APIBase engine), so it

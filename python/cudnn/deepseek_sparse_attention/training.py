@@ -16,6 +16,11 @@ from typing import Any, Callable, Optional
 
 import torch
 from cudnn.api_base import TupleDict
+from cudnn.frost.buffers import cutedsl_requirement_error
+from .indexer_top_k.api import compactify_wrapper
+from .sparse_attention_forward.api import sparse_attention_forward_wrapper
+from .sparse_attention_backward.api import sparse_attention_backward_wrapper
+from .score_recompute.api import sparse_attn_score_recompute_wrapper
 
 
 def _validate_contract(q, kv, indices, attn_sink, topk_length, softmax_scale):
@@ -50,8 +55,6 @@ def _validate_contract(q, kv, indices, attn_sink, topk_length, softmax_scale):
         raise ValueError("softmax_scale must be finite and positive")
     if not q.is_cuda or torch.cuda.get_device_capability(q.device) != (10, 0):
         raise NotImplementedError("native sparse attention training currently requires SM100")
-    from cudnn.frost.buffers import cutedsl_requirement_error
-
     error = cutedsl_requirement_error("native DSA training")
     if error:
         raise RuntimeError(error)
@@ -116,8 +119,6 @@ def _normalize_cudnn_sparse_metadata(
 
     if _compactify is None:
         # Lazy import preserves the optional CuTe DSL boundary at module import.
-        from .indexer_top_k.api import compactify_wrapper
-
         _compactify = compactify_wrapper
     compact = _compactify(normalized)
     return compact["indices"], compact["topk_length"]
@@ -132,8 +133,6 @@ def _pad_indices(indices):
 
 
 def _native_forward(q, kv, indices, sink, lengths, scale):
-    from .sparse_attention_forward.api import sparse_attention_forward_wrapper
-
     heads = q.shape[1]
     launch_q, launch_sink = q, sink
     if heads < 64:
@@ -182,8 +181,6 @@ class _SparseAttention(torch.autograd.Function):
         if dout is None:
             return (None,) * 7
         q, kv, out, lse, sink, indices, *rest = ctx.saved_tensors
-        from .sparse_attention_backward.api import sparse_attention_backward_wrapper
-
         with torch.cuda.device(q.device):
             result = sparse_attention_backward_wrapper(
                 q,
@@ -248,8 +245,6 @@ def sparse_attention_score_recompute(
     scale = _validate_contract(q, kv, indices, None, topk_length, softmax_scale)
     if not isinstance(lse, torch.Tensor) or lse.shape != q.shape[:2] or lse.dtype != torch.float32 or lse.device != q.device or not lse.is_contiguous():
         raise ValueError("lse must be contiguous FP32 [S_q,H] on Q's device")
-    from .score_recompute.api import sparse_attn_score_recompute_wrapper
-
     with torch.cuda.device(q.device):
         safe_indices, _ = _normalize_sparse_index_slots(indices, topk_length, kv.shape[0])
         result = sparse_attn_score_recompute_wrapper(

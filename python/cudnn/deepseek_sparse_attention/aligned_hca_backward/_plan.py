@@ -11,6 +11,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ._kernels import normalize, reduce_local_keys, reduce_local_rows, reduce_sink, pack_rank_major_keys, reduce_rank_major_keys, separate_tma_scores
 from ._workspace import workspace_layout
+from ._gemms import _HcaGroupedGemms
 
 
 class _HcaPlan:
@@ -110,8 +111,6 @@ class _HcaPlan:
             for kernel, grid, names, constants, options in self._schedule():
                 compiled = kernel.warmup(*(tensors[name] for name in names), *constants, grid=grid, **options)
                 launches.append((compiled[grid], names, constants))
-            from ._gemms import _HcaGroupedGemms
-
             self._gemms = _HcaGroupedGemms(self.layout)
         self._launches = tuple(launches)
         return self

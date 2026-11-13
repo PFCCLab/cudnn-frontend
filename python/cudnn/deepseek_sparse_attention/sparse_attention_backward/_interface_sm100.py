@@ -26,6 +26,18 @@ from .dsa_bwd_sm100_deterministic import (
     _deterministic_kernel_class_for_config,
     deterministic_kernel_class,
 )
+from .dsa_bwd_sm100_h128_2cta import (
+    FlashAttentionDSABackwardSm100H128TwoCTA,
+    FlashAttentionDSABackwardSm100H128TwoCTADeterministic,
+)
+from .dsa_bwd_sm100_h128_d576_2cta import (
+    FlashAttentionDSABackwardSm100H128D576TwoCTA,
+    FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic,
+)
+from .dsa_bwd_sm100_h16 import FlashAttentionDSABackwardSm100H16
+from .dsa_bwd_sm100_h32 import FlashAttentionDSABackwardSm100H32
+from .dsa_bwd_sm100_h96 import FlashAttentionDSABackwardSm100H96, FlashAttentionDSABackwardSm100H96Deterministic
+from ._interface_sm100_d576 import flash_attn_bwd_sm100_d576_2cta
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
@@ -77,8 +89,11 @@ def _carve_workspace_sm100(
     if not workspace.is_contiguous():
         raise ValueError("workspace must be contiguous")
     flat = workspace.view(-1)
-    if flat.numel() < required:
-        raise ValueError(f"SM100 DSA backward requires a {required}-byte workspace; the provided buffer has {flat.numel()} bytes")
+    # ``shape``, not ``numel()``: under Paddle's torch proxy ``numel()`` is a 0-D device
+    # tensor, so comparing it forces a device-to-host sync on every call.
+    workspace_bytes = int(flat.shape[0])
+    if workspace_bytes < required:
+        raise ValueError(f"SM100 DSA backward requires a {required}-byte workspace; the provided buffer has {workspace_bytes} bytes")
     if flat.data_ptr() % 16 != 0:
         raise ValueError(f"workspace must be at least 16-byte aligned; got data_ptr=0x{flat.data_ptr():x}")
 
@@ -178,24 +193,14 @@ def _get_sm100_kernel_class(
         if backend != "generic_m64":
             raise ValueError("deterministic_relay_cluster_size is supported only by the deterministic generic_m64 backend")
     if backend == "h128_2cta_m64":
-        from .dsa_bwd_sm100_h128_2cta import FlashAttentionDSABackwardSm100H128TwoCTA, FlashAttentionDSABackwardSm100H128TwoCTADeterministic
-
         return FlashAttentionDSABackwardSm100H128TwoCTADeterministic if deterministic else FlashAttentionDSABackwardSm100H128TwoCTA
     if backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64"):
-        from .dsa_bwd_sm100_h128_d576_2cta import FlashAttentionDSABackwardSm100H128D576TwoCTA, FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic
-
         return FlashAttentionDSABackwardSm100H128D576TwoCTADeterministic if deterministic else FlashAttentionDSABackwardSm100H128D576TwoCTA
     if backend == "h16_m128":
-        from .dsa_bwd_sm100_h16 import FlashAttentionDSABackwardSm100H16
-
         return FlashAttentionDSABackwardSm100H16
     if backend == "h32_m64":
-        from .dsa_bwd_sm100_h32 import FlashAttentionDSABackwardSm100H32
-
         return FlashAttentionDSABackwardSm100H32
     if backend == "h96_h64_h32":
-        from .dsa_bwd_sm100_h96 import FlashAttentionDSABackwardSm100H96, FlashAttentionDSABackwardSm100H96Deterministic
-
         return FlashAttentionDSABackwardSm100H96Deterministic if deterministic else FlashAttentionDSABackwardSm100H96
     if deterministic:
         if total_s_q is None or total_s_kv is None or head_dim is None:
@@ -571,8 +576,6 @@ def flash_attn_bwd_sm100(
         # The D576 two-CTA kernel has its own plan-time compile and launch
         # contract (see ``_interface_sm100_d576``); it shares this entry point
         # only so direct callers get the same selection as the plan.
-        from ._interface_sm100_d576 import flash_attn_bwd_sm100_d576_2cta
-
         return flash_attn_bwd_sm100_d576_2cta(
             q,
             kv,
@@ -623,7 +626,7 @@ def flash_attn_bwd_sm100(
     # sum_dSink uses atomics and needs this reset; deterministic sum_dSink and
     # the H128 two-CTA zero_init overwrite/clear d_sink themselves.
     if not uses_h128_two_cta and not deterministic:
-        memset_zero_async(d_sink.data_ptr(), d_sink.numel() * d_sink.element_size(), int(current_stream))
+        memset_zero_async(d_sink.data_ptr(), math.prod(d_sink.shape) * d_sink.element_size(), int(current_stream))
 
     problem_shape = (total_S_q, total_S_kv, head_dim, (num_head, batch_size))
 

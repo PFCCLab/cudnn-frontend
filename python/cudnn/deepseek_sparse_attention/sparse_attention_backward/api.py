@@ -22,6 +22,7 @@ from cudnn.api_base import APIBase, TupleDict
 from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
 
+from . import _interface_sm90 as _iface_sm90
 from . import _interface_sm100 as _iface_sm100
 from . import _interface_sm100_d576 as _iface_d576
 from ._sm90_relay import (
@@ -30,6 +31,7 @@ from ._sm90_relay import (
     sm90_deterministic_relay_indexing_error,
     sm90_deterministic_relay_requirement_error,
 )
+from ._qcluster_sm100 import compile_plan, workspace_size
 
 
 def _checked_deterministic_relay_cluster_size(value: Optional[int]) -> Optional[int]:
@@ -339,8 +341,6 @@ class SparseAttentionBackward(APIBase):
         """
         self._ensure_support_checked()
         if self.q_cluster_mode == "adaptive_pair":
-            from ._qcluster_sm100 import compile_plan
-
             total_q, heads, dim = self.q_desc.shape
             tile = 128 if heads == 16 else 64
             if total_q >= 2 and self.topk_idxs_desc.shape[1] > 2 * tile:
@@ -446,12 +446,8 @@ class SparseAttentionBackward(APIBase):
         total_s_kv = self.kv_desc.shape[0]
         tile = 128 if num_heads == 16 else 64
         if self.q_cluster_mode == "adaptive_pair" and total_s_q >= 2 and self.topk_idxs_desc.shape[1] > 2 * tile:
-            from ._qcluster_sm100 import workspace_size
-
             return workspace_size(total_s_q, total_s_kv, head_dim, num_heads, self.topk_idxs_desc.shape[1])
         if major == 9:
-            from . import _interface_sm90 as _iface_sm90
-
             return _iface_sm90.flash_attn_bwd_sm90_workspace_size(
                 total_s_q,
                 total_s_kv,
@@ -557,8 +553,6 @@ class SparseAttentionBackward(APIBase):
         major, _ = device_capability(q.device)
         with torch.cuda.device(q.device):
             if major == 9:
-                from . import _interface_sm90 as _iface_sm90
-
                 return _iface_sm90.flash_attn_bwd_sm90(
                     q,
                     kv,
@@ -667,13 +661,13 @@ def sparse_attention_backward_wrapper(
     key = (
         q.device,
         q.dtype,
-        q.shape,
-        kv.shape,
-        out.shape,
-        dout.shape,
-        lse.shape,
-        attn_sink.shape,
-        topk_idxs.shape,
+        tuple(q.shape),
+        tuple(kv.shape),
+        tuple(out.shape),
+        tuple(dout.shape),
+        tuple(lse.shape),
+        tuple(attn_sink.shape),
+        tuple(topk_idxs.shape),
         topk_length is not None,
         int(block_tile),
         softmax_scale,

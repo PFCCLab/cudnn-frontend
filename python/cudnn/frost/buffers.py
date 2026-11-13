@@ -26,6 +26,7 @@ import struct
 import sys
 
 from cudnn import _pybind_module
+from .device import device_context
 
 _LOG = logging.getLogger(__name__)
 
@@ -324,8 +325,6 @@ def _dlpack_geometry(buf):
     if dlpack_device is not None:
         device_type, device_id = dlpack_device()
         if int(device_type) == _KDL_CUDA:
-            from .device import device_context
-
             context = device_context(int(device_id))
     with context:
         try:

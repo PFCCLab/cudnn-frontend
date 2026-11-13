@@ -185,8 +185,6 @@ class DeviceInfo:
         """Per-CTA SMEM ceiling in the *oversized* carveout (327 KiB vs the 227 KiB
         opt-in limit on SM 10.7), which the part gives by shrinking L1 to 8 kB —
         free for a TMA-fed GEMM. 0 when the driver has no such mode."""
-        from . import _env
-
         drv = _driver()
         # CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK (ordinal 150)
         # arrived in CUDA 13.4. The DRIVER decides whether the mode exists at all,
@@ -223,3 +221,9 @@ def device_info(ordinal: int) -> DeviceInfo:
     facts are queried once and shared. Keyed by ordinal, never by Handle: the
     driver caches key on the ordinal, and two handles on the same GPU share facts."""
     return DeviceInfo(int(ordinal))
+
+
+# Bound after the definitions above: ``_env`` imports ``_ck`` / ``_driver`` from here. Not
+# deferred into DeviceInfo, because paddlefleet_ops renames ``cudnn.*`` in sys.modules
+# once the package has loaded and a later relative import can no longer resolve.
+from . import _env  # noqa: E402

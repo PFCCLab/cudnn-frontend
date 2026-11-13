@@ -17,13 +17,25 @@ call sites carried that guard as local copies and the fourteenth missed it
 It cannot be mapped to torch's legacy default stream or safely used as a shared
 allocator stream identity. Torch interop rejects it; use a concrete torch stream.
 
-torch is imported lazily: ``python/cudnn`` must import without it.
+``python/cudnn`` must import without torch, so a missing torch leaves ``torch``
+None here. The import sits at module top rather than in each function: under
+Paddle's torch proxy (``paddle.enable_compat(scope={"cudnn"})``) only imports
+executed while the package loads resolve to the proxy -- paddlefleet_ops renames
+the loaded modules afterwards, and a deferred ``import torch`` would pick up a
+real torch install instead. The proxy lacks ``default_stream``, ``ExternalStream``
+and ``Tensor.record_stream``; the ``_default_stream`` / ``_external_stream`` /
+``_record_stream`` helpers below cover those.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from typing import Any, Iterator, Optional
+
+try:
+    import torch
+except ImportError:  # pragma: no cover - torch-free install
+    torch = None
 
 # cudaStream_t 0 and cudaStreamLegacy. The per-thread sentinel 2 is NOT legacy.
 DEFAULT_STREAM_HANDLES = frozenset({0, 1})
@@ -36,7 +48,34 @@ def _device_index(torch, device) -> int:
         return torch.cuda.current_device()
     if isinstance(device, int):
         return device
+    if hasattr(device, "get_device_id"):  # Paddle: Stream.device is a CUDAPlace
+        return device.get_device_id()
     return device.index if device.index is not None else torch.cuda.current_device()
+
+
+def _default_stream(torch, device):
+    """``torch.cuda.default_stream(device)``. Paddle has no stream object for the legacy
+    default stream; its current stream is created blocking (``FLAGS_use_default_stream``
+    off), so it orders against ``CUstream(0)`` and stands in for it."""
+    default_stream = getattr(torch.cuda, "default_stream", None)
+    if default_stream is not None:
+        return default_stream(device)
+    return torch.cuda.current_stream(_device_index(torch, device))
+
+
+def _external_stream(torch, handle: int, device):
+    external_stream = getattr(torch.cuda, "ExternalStream", None)
+    if external_stream is not None:
+        return external_stream(handle, device=device)
+    # Paddle: wraps the handle without owning it.
+    return torch.cuda.get_stream_from_external(handle, _device_index(torch, device))
+
+
+def _record_stream(tensor, stream) -> None:
+    record_stream = getattr(tensor, "record_stream", None)
+    if record_stream is None:  # Paddle spells it ``_record_stream``
+        record_stream = tensor._record_stream
+    record_stream(stream)
 
 
 def _raw_current_stream(torch, device) -> Optional[int]:
@@ -66,22 +105,21 @@ def as_torch_stream(stream, device=None):
     torch's current stream -> itself; only a genuine side stream is wrapped in
     ``torch.cuda.ExternalStream(handle, device=device)``.
     """
-    import torch
-
     if isinstance(stream, torch.cuda.Stream):
-        if device is not None and stream.device != torch.device("cuda", _device_index(torch, device)):
+        # Compare ordinals: Paddle's Stream.device is a CUDAPlace, never equal to a device object.
+        if device is not None and _device_index(torch, stream.device) != _device_index(torch, device):
             raise ValueError(f"stream must be on cuda:{_device_index(torch, device)}, got {stream.device}")
         _reject_per_thread_stream(stream.cuda_stream)
         return stream
     handle = int(stream)
     _reject_per_thread_stream(handle)
-    default = torch.cuda.default_stream(device)
+    default = _default_stream(torch, device)
     if handle in DEFAULT_STREAM_HANDLES or handle == default.cuda_stream:
         return default
     current = torch.cuda.current_stream(device)
     if handle == current.cuda_stream:
         return current
-    return torch.cuda.ExternalStream(handle, device=device)
+    return _external_stream(torch, handle, device)
 
 
 @contextmanager
@@ -95,8 +133,6 @@ def stream_context(stream, device=None, *, verify_current: bool = False) -> Iter
     if stream is None:
         yield
         return
-    import torch
-
     handle = stream.cuda_stream if isinstance(stream, torch.cuda.Stream) else int(stream)
     _reject_per_thread_stream(handle)
     if not verify_current:
@@ -113,8 +149,6 @@ def stream_context(stream, device=None, *, verify_current: bool = False) -> Iter
 def launch_stream(stream, device=None):
     """The torch stream a launch on ``stream`` runs on: ``as_torch_stream(stream, device)``,
     or torch's current stream on ``device`` when ``stream`` is None."""
-    import torch
-
     index = _device_index(torch, device)
     if stream is None:
         stream = _raw_current_stream(torch, index)
@@ -125,9 +159,7 @@ def launch_stream(stream, device=None):
 
 def device_context(device):
     """``torch.cuda.device(device)``, or a no-op when ``device`` is already current."""
-    import torch
-
-    index = device if isinstance(device, int) else device.index
+    index = device if isinstance(device, int) else (device.get_device_id() if hasattr(device, "get_device_id") else device.index)
     if index is None or index == torch.cuda.current_device():
         return nullcontext()
     return torch.cuda.device(index)
@@ -148,7 +180,7 @@ def record_streams(tensors, stream, device=None) -> None:
             continue
         if consumer is None:
             consumer = launch_stream(stream, device if device is not None else tensor.device)
-        tensor.record_stream(consumer)
+        _record_stream(tensor, consumer)
 
 
 def contiguous_on_stream(tensor, stream, device=None):

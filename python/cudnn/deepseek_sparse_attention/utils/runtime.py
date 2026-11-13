@@ -3,13 +3,26 @@
 
 """Runtime helpers shared by DSA Python wrappers."""
 
+from contextlib import contextmanager
 from functools import lru_cache
-from typing import Optional
+from typing import Iterator, Optional
 
 import torch
 
 from cudnn._torch_stream import record_streams, stream_context
 import cuda.bindings.driver as cuda
+
+if hasattr(torch.cuda, "nvtx") and not hasattr(torch.cuda.nvtx, "range"):
+
+    @contextmanager
+    def _nvtx_range(msg: str) -> Iterator[None]:
+        torch.cuda.nvtx.range_push(msg)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+
+    torch.cuda.nvtx.range = _nvtx_range
 
 
 @lru_cache(maxsize=None)
@@ -73,7 +86,10 @@ def validate_q_causal_offsets(
 def resolve_stream(current_stream: Optional[cuda.CUstream] = None) -> cuda.CUstream:
     if current_stream is not None:
         return current_stream
-    return cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
+    stream = torch.cuda.current_stream(torch.cuda.current_device())
+    # Paddle's stream exposes the raw handle as ``stream_base.raw_stream``.
+    handle = stream.cuda_stream if hasattr(stream, "cuda_stream") else stream.stream_base.raw_stream
+    return cuda.CUstream(handle)
 
 
 def torch_stream_context(current_stream: Optional[cuda.CUstream] = None, device=None):

@@ -3,6 +3,8 @@
 
 import sys
 import importlib
+import cudnn
+from .frost.buffers import DTYPES
 
 
 def is_windows():
@@ -28,7 +30,7 @@ def is_torch_available():
     # this condition ensures that datatype mapping is only created once
     if torch_available is None:
         try:
-            import torch
+            import paddle as torch
 
             torch_available = True
             _torch_to_cudnn_data_type_dict = {
@@ -80,7 +82,7 @@ def _is_torch_to_cutlass_available():
     global _torch_to_cutlass_data_type_dict
     if _torch_to_cutlass_data_type_dict is None:
         try:
-            import torch
+            import paddle as torch
             import cutlass
 
             mapping = {
@@ -238,9 +240,12 @@ def _buffer_dtype_to_cudnn(dtype) -> cudnn_data_type:
 
 
 def _torch_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = False):
-    # A torch dtype can only be passed in if torch is already imported, so probing
-    # sys.modules avoids importing torch on behalf of other frameworks' dtypes.
-    torch = sys.modules.get("torch")
+    # A framework dtype can only be passed in if the framework is already
+    # imported, so probing sys.modules avoids importing it on behalf of other
+    # frameworks' dtypes.  On this branch the framework is Paddle, and a real
+    # ``torch`` may also be installed alongside it -- probing "torch" would then
+    # hand back PyTorch and every Paddle dtype would miss the mapping below.
+    torch = sys.modules.get("paddle")
     if torch is None or not isinstance(data_type, torch.dtype):
         return None
     if is_cutlass_available() and _is_torch_to_cutlass_available():
@@ -333,14 +338,12 @@ def _library_type(input_type):
     # with the type callers already catch, so a routing layer can read it as
     # "the backend cannot represent this" instead of guessing from a bare
     # Exception.
-    import cudnn
-
     raise cudnn.cudnnGraphNotSupportedError(f"No available conversion from type {input_type} to a library type.")
 
 
 def _is_torch_tensor(input_tensor) -> bool:
     if is_torch_available():
-        import torch
+        import paddle as torch
 
         return isinstance(input_tensor, torch.Tensor)
     return False
@@ -362,8 +365,6 @@ _CUDNN_TO_DLPACK_CODE_BITS = {}
 
 
 def _init_dlpack_dtype_tables():
-    from .frost.buffers import DTYPES
-
     for enum, name in _CUDNN_TO_FROST_DTYPE_NAME.items():
         code_bits = DTYPES.get(name)
         if code_bits is None:

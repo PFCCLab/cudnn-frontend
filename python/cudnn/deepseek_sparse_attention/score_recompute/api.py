@@ -26,6 +26,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
 from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream, record_streams
 from cudnn.api_base import APIBase, TupleDict
 
+from . import _interface_sm90 as _iface_sm90
 from . import _interface_sm100 as _iface_sm100
 from ._block_scaled import BLOCK_SCALED_PRECISION_NAMES
 
@@ -285,8 +286,6 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
         _require_live_optional(self, topk_length, self.topk_length_desc, "topk_length")
         major, _ = device_capability()
         if major == 9:
-            from . import _interface_sm90 as _iface_sm90
-
             return _iface_sm90.sparse_indexer_score_recompute(
                 q_indexer,
                 k_indexer,
@@ -464,8 +463,6 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
         scale = self.softmax_scale if softmax_scale is None else float(softmax_scale)
         major, _ = device_capability()
         if major == 9:
-            from . import _interface_sm90 as _iface_sm90
-
             return _iface_sm90.sparse_attn_score_recompute(
                 q_attn,
                 k_attn,
@@ -812,8 +809,6 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
         _require_dense_live(self, q, k, weights, self.w_desc, "weights", out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets)
         major, _ = device_capability()
         if major == 9:
-            from . import _interface_sm90 as _iface_sm90
-
             return _iface_sm90.dense_indexer_score_recompute(
                 q,
                 k,
@@ -937,8 +932,6 @@ def dense_indexer_score_recompute_wrapper(
         )
         return _dense_wrapper_result(stream, o, d, out_user, denom_user)
     if _dense_sm90_thd_wrapper_path(is_thd, q.device):
-        from . import _interface_sm90 as _iface_sm90
-
         o, d = _iface_sm90.dense_indexer_score_recompute(
             q,
             k,
@@ -1107,8 +1100,6 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
         _require_dense_live(self, q, k, lse, self.lse_desc, "lse", out, denom_out, cu_seqlens_q, cu_seqlens_k, q_causal_offsets)
         major, _ = device_capability()
         if major == 9:
-            from . import _interface_sm90 as _iface_sm90
-
             return _iface_sm90.dense_attn_score_recompute(
                 q,
                 k,
@@ -1223,8 +1214,6 @@ def dense_attn_score_recompute_wrapper(
         )
         return _dense_wrapper_result(stream, o, d, out_user, denom_user)
     if _dense_sm90_thd_wrapper_path(is_thd, q.device):
-        from . import _interface_sm90 as _iface_sm90
-
         o, d = _iface_sm90.dense_attn_score_recompute(
             q,
             k,

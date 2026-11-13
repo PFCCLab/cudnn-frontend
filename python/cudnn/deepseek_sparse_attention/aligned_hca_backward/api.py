@@ -11,6 +11,7 @@ import threading
 import cuda.bindings.driver as cuda
 import torch
 
+from cudnn._torch_stream import _default_stream, _device_index, _external_stream
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 
 try:
@@ -46,18 +47,18 @@ def _launch_stream(current_stream, device):
     if current_stream is None:
         return torch.cuda.current_stream(device)
     if isinstance(current_stream, torch.cuda.Stream):
-        if current_stream.device != device:
+        if _device_index(torch, current_stream.device) != _device_index(torch, device):
             raise ValueError("The launch stream must belong to the tensor device")
         return current_stream
     if isinstance(current_stream, bool) or not isinstance(current_stream, (int, cuda.CUstream)):
         raise TypeError("current_stream must be a Torch CUDA stream, CUstream, integer handle, or None")
     handle = int(current_stream)
     if handle == 0:
-        return torch.cuda.default_stream(device)
+        return _default_stream(torch, device)
     if handle < 3:
         raise ValueError("Pass a CUDA stream object or concrete handle, not a legacy/PTDS sentinel")
     current = torch.cuda.current_stream(device)
-    return current if current.cuda_stream == handle else torch.cuda.ExternalStream(handle, device=device)
+    return current if current.cuda_stream == handle else _external_stream(torch, handle, device)
 
 
 class AlignedHCABackward(APIBase):

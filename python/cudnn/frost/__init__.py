@@ -16,6 +16,7 @@ asking costs no DSL import.
 """
 
 import operator
+from .buffers import cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 
 __all__ = ["cutedsl_runtime_available"]
 
@@ -49,8 +50,6 @@ def cutedsl_runtime_available(device_cc=None) -> bool:
     False when the DSL is absent or below the floor (no exception); a
     ``device_cc`` that is not a pair of integers raises ``TypeError``.
     """
-    from .buffers import cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
-
     installed, version = cutedsl_state()
     if not installed or cutedsl_too_old(version):
         return False

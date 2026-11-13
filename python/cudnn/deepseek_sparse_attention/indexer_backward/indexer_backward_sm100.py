@@ -86,7 +86,6 @@ from functools import partial
 from typing import Any, cast
 import torch
 import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute import atom as cute_atom
@@ -121,6 +120,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     resolve_stream as _resolve_stream,
     torch_stream_context as _torch_stream_context,
 )
+from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from cudnn.frost.buffers import memset_zero_async
 
 from .deterministic_dk_sm100 import (
@@ -502,7 +502,12 @@ class IndexerBackwardSm100:
         # needed to construct a Gather4 descriptor. Keep those wheels on the
         # existing manual cp.async loader; both paths feed identical BF16 K
         # tiles into the same FP32 GEMMs.
-        self.use_tma_gather = _HAS_TMA_GATHER4
+        # The Gather4 loader issues a fixed 4 warps x 8 lanes x 4 rows = 128
+        # rows per stage. With block_I=64 it lands twice the stage's expect-tx
+        # bytes on MBAR_K_LOADED and the kernel never finishes. The cp.async
+        # loader finishes but its d_index_k is wrong at block_I=64, so
+        # IndexerBackward.check_support rejects block_I != 128 on SM100.
+        self.use_tma_gather = _HAS_TMA_GATHER4 and block_I == 128
         # Cross-row double buffering is sized for the established short-row
         # variants. Deterministic TopK 1024/2048 uses the fully drained serial
         # persistent loop so its one-row SMEM footprint stays within the cap.
@@ -3793,7 +3798,6 @@ def _score_grad_inplace_cute(
     dIndexK_f32=None,
     current_stream=None,
 ):
-    from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
     # Kernel reads ``mGradLoss[0]`` so it must be at least 1-D. ``to_cute_tensor``
     # defaults ``leading_dim = ndim - 1`` which collapses to -1 for a 0-D scalar
@@ -3895,7 +3899,6 @@ def _build_cute_dsl_kernel(
     deterministic_dk_planes: int = DEFAULT_DK_PLANES,
 ):
     """Create lazily compiled score/GEMM runners for one launch policy."""
-    from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
     persistent_grid_size = None
     if deterministic:
@@ -4119,7 +4122,7 @@ def _build_cute_dsl_kernel(
                 current_stream=current_stream,
             )
             with _torch_stream_context(current_stream):
-                dIndexK.copy_(dIndexK_f32)
+                dIndexK.copy_(dIndexK_f32.astype(dIndexK.dtype))
 
     _run.score_grad = partial(_score_grad_inplace, block_I=block_I)
     _run.score_grad_zero = partial(_score_grad_inplace, block_I=block_I)

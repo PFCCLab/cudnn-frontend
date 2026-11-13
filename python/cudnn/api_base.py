@@ -14,7 +14,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, List, Tuple, Optional
 import logging
-import sys
 import threading
 import cuda.bindings.driver as cuda
 import cutlass
@@ -38,13 +37,20 @@ from cudnn.tensor_adapter import (
     get_strides,
 )
 
-# torch stays a lazy dependency: a torch tensor/dtype can only reach these APIs if torch
-# is already imported, so probing sys.modules never imports torch on behalf of other
-# frameworks (e.g. JAX).
+# On this branch the framework is always PaddlePaddle. Upstream probes
+# ``sys.modules["torch"]``, which is wrong here for two reasons: a real PyTorch is
+# routinely installed alongside Paddle in the same environment (and it describes neither
+# Paddle's dtypes -- ``paddle.dtype`` is not a ``torch.dtype``, so ``_check_dtype``
+# rejects every valid tensor with "Expected dtype to be a torch.dtype or list" -- nor
+# Paddle's devices or current stream), and ``paddle.enable_compat(scope={"cudnn"})``
+# rewrites only the *module-level* ``import torch`` of the modules it loads, so it never
+# puts the shim in ``sys.modules``. Reach for Paddle directly instead.
 
 
 def _torch():
-    return sys.modules.get("torch")
+    import paddle
+
+    return paddle
 
 
 _RAW_STREAM = None
@@ -53,12 +59,15 @@ _RAW_STREAM = None
 def _raw_stream(torch):
     """``device_index -> raw CUstream int``, resolved once.
 
-    ``torch._C._cuda_getCurrentRawStream`` is private, so fall back to the
-    documented accessor if a torch build ever drops it.
+    Paddle has no ``torch._C._cuda_getCurrentRawStream`` and its ``Stream`` exposes the
+    raw handle as ``stream_base.raw_stream`` rather than ``.cuda_stream``; this is the
+    same handle the DSA wrappers launch on (``utils/runtime.resolve_stream``).
     """
     global _RAW_STREAM
     if _RAW_STREAM is None:
-        _RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None) or (lambda _dev: torch.cuda.current_stream().cuda_stream)
+        _RAW_STREAM = getattr(getattr(torch, "_C", None), "_cuda_getCurrentRawStream", None) or (
+            lambda _dev: torch.cuda.current_stream().stream_base.raw_stream
+        )
     return _RAW_STREAM
 
 
@@ -82,7 +91,8 @@ def tensor_byte_span(t) -> Tuple[int, int]:
     side, a zero stride on neither), the last element's bytes included; an empty tensor spans nothing (``lo == hi``).  Host arithmetic on
     the metadata alone -- no device read, no synchronisation -- so it belongs on an execute path (Rule 1 / Rule 3)."""
     base = int(t.data_ptr())
-    if t.numel() == 0:
+    # Shape, not ``numel()``: under Paddle ``numel()`` is a 0-D GPU tensor and comparing it syncs.
+    if 0 in tuple(t.shape):
         return base, base
     item = int(t.element_size())
     lo = hi = 0
@@ -161,8 +171,11 @@ class TensorDesc:
         stride = tuple(self.stride)
         stride_order = tuple(self.stride_order)
         device = self.device
-        torch = _torch()
-        if torch is not None and not isinstance(device, (torch.device, Device)):
+        # Paddle devices, spelled through Paddle directly rather than ``_torch()``
+        # so that this stays correct even if the compat shim is not installed.
+        import paddle as torch
+
+        if not isinstance(device, (torch.device.Device, Device)):
             try:
                 device = torch.device(device)
             except (TypeError, ValueError, RuntimeError) as exc:
@@ -345,15 +358,21 @@ class TensorDesc:
     def is_contiguous(self, memory_format: Any = None) -> bool:
         """Row-major contiguity check; ``memory_format=None`` means torch.contiguous_format semantics."""
         torch = _torch()
-        if memory_format is None or (torch is not None and memory_format in {torch.contiguous_format, torch.preserve_format}):
+        # Paddle's torch-compat shim has no ``memory_format`` enum, so these
+        # attributes can be missing; look them up defensively instead of
+        # touching ``torch.contiguous_format`` unconditionally.
+        row_major_formats = {getattr(torch, name) for name in ("contiguous_format", "preserve_format") if hasattr(torch, name)}
+        if memory_format is None or memory_format in row_major_formats:
             if self._numel(self.shape) == 0:
                 return True
             return self._is_contiguous_with_order(self.shape, self.stride, tuple(range(self.ndim - 1, -1, -1)))
-        if torch is not None and memory_format == torch.channels_last:
+        channels_last = getattr(torch, "channels_last", None)
+        if channels_last is not None and memory_format == channels_last:
             if self.ndim != 4:
                 return False
             return self._is_contiguous_with_order(self.shape, self.stride, (1, 3, 2, 0))
-        if torch is not None and memory_format == torch.channels_last_3d:
+        channels_last_3d = getattr(torch, "channels_last_3d", None)
+        if channels_last_3d is not None and memory_format == channels_last_3d:
             if self.ndim != 5:
                 return False
             return self._is_contiguous_with_order(self.shape, self.stride, (1, 4, 3, 2, 0))
@@ -704,6 +723,7 @@ class APIBase(ABC):
         :return: True if tensor/dtype is an FP4x2 packed type
         :rtype: bool
         """
+        return False  # Paddle not support FP4 dtype now
         if tensor_or_dtype is None:
             return False
         if isinstance(tensor_or_dtype, TensorDesc):
@@ -1196,14 +1216,18 @@ class WorkspaceCarver:
         flat = workspace if workspace.dtype == torch.uint8 else workspace.view(torch.uint8)
         if flat.dim() != 1:
             flat = flat.view(-1)
-        if flat.numel() < required:
+        # Host byte count from the 1-D shape: under Paddle ``numel()`` is a 0-D GPU tensor and every
+        # comparison against it is a device-to-host sync on the execute path.
+        nbytes = int(flat.shape[0])
+        if nbytes < required:
             raise ValueError(
                 f"cudnn: {owner} requires a {required}-byte workspace; the provided "
-                f"buffer has only {flat.numel()} bytes (size it with graph.get_workspace_size())"
+                f"buffer has only {nbytes} bytes (size it with graph.get_workspace_size())"
             )
         if flat.data_ptr() % align != 0:
             raise ValueError(f"cudnn: {owner} workspace must be at least {align}-byte aligned; got data_ptr=0x{flat.data_ptr():x}")
         self._flat = flat
+        self._nbytes = nbytes
         self._off = 0
         self._owner = owner
 
@@ -1211,10 +1235,10 @@ class WorkspaceCarver:
         """The next scratch chunk: a 1-D ``numel``-element view of ``dtype``."""
         nbytes = int(numel) * dtype.itemsize
         start, end = self._off, self._off + nbytes
-        if end > self._flat.numel():
-            raise ValueError(f"cudnn: {self._owner} workspace overrun: chunk [{start}, {end}) exceeds the {self._flat.numel()}-byte buffer (sizing bug)")
+        if end > self._nbytes:
+            raise ValueError(f"cudnn: {self._owner} workspace overrun: chunk [{start}, {end}) exceeds the {self._nbytes}-byte buffer (sizing bug)")
         self._off = start + ws_align(nbytes)
-        chunk = self._flat if start == 0 and end == self._flat.numel() else self._flat[start:end]
+        chunk = self._flat if start == 0 and end == self._nbytes else self._flat[start:end]
         try:
             return chunk.view(dtype)
         except RuntimeError as exc:

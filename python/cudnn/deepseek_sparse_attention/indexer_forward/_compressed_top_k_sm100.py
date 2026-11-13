@@ -49,6 +49,7 @@ from ._support import (
     resolve_m_block_size as _resolve_m_block_size,
     validate_qhead_per_kv_head as _validate_indexer_qhead_per_kv_head,
 )
+from ..indexer_top_k.compress_top_k_sm100 import per_batch_floats, compress_stage2_topk, compress_stage2_topk_varlen
 
 _compile_cache: dict = {}
 
@@ -161,8 +162,6 @@ def compress_topk_cand_buffer_size(
     Pass the launch's ``precision``: block-scaled precisions (``"mxfp8"``, ``"mxfp4"``)
     always run a single launch, so this returns the full buffer and an explicit
     ``microbatch_rows > 0`` raises, as at launch."""
-    from ..indexer_top_k.compress_top_k_sm100 import per_batch_floats
-
     _check_q_covered_by_k(seqlen_q, seqlen_k, ratio)
     precision = validate_indexer_precision(precision)
     if precision in BLOCK_SCALED_FORMATS:
@@ -342,11 +341,6 @@ def indexer_fwd_compress_topk(
     stage-1 epilogue also returns the per-row LSE (all precisions). An explicit
     ``microbatch_rows > 0`` remains unsupported with LSE.
     """
-    from ..indexer_top_k.compress_top_k_sm100 import (
-        compress_stage2_topk,
-        per_batch_floats,
-    )
-
     if return_softmax is None:
         return_softmax = _RETURN_SOFTMAX_DEFAULT
     precision = validate_indexer_precision(precision)
@@ -1202,8 +1196,6 @@ def _indexer_fwd_compress_topk_thd(
     ``deterministic=True`` makes exact-value ties at the K-th boundary select the
     smallest local KV indices; output slot order is still unspecified.
     """
-    from ..indexer_top_k.compress_top_k_sm100 import compress_stage2_topk_varlen
-
     if return_softmax is None:
         return_softmax = _RETURN_SOFTMAX_DEFAULT
     precision = validate_indexer_precision(precision)
