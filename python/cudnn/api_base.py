@@ -1230,9 +1230,19 @@ class WorkspaceCarver:
         self._nbytes = nbytes
         self._off = 0
         self._owner = owner
+        self._typed_bases = {}
 
     def take(self, numel: int, dtype) -> Any:
-        """The next scratch chunk: a 1-D ``numel``-element view of ``dtype``."""
+        """The next scratch chunk: a 1-D ``numel``-element view of ``dtype``.
+
+        The chunk is checked to start exactly ``start`` bytes into the buffer.
+        Paddle's ``view(dtype)`` on a sliced tensor rescales the slice's byte
+        offset by the itemsize (``buf[4096:].view(int32)`` lands at byte 1024),
+        so a typed chunk past the first would silently alias an earlier one.
+        When that happens the chunk is re-cut from a typed view of the whole
+        buffer by element index instead, which means the same bytes in both
+        frameworks; any remaining mismatch raises rather than aliasing.
+        """
         nbytes = int(numel) * dtype.itemsize
         start, end = self._off, self._off + nbytes
         if end > self._nbytes:
@@ -1240,9 +1250,34 @@ class WorkspaceCarver:
         self._off = start + ws_align(nbytes)
         chunk = self._flat if start == 0 and end == self._nbytes else self._flat[start:end]
         try:
-            return chunk.view(dtype)
+            out = chunk.view(dtype)
         except RuntimeError as exc:
             raise ValueError(f"cudnn: {self._owner} workspace is not sufficiently aligned for {dtype} scratch: {exc}") from None
+        want = self._flat.data_ptr() + start
+        if out.data_ptr() == want:
+            return out
+        return self._typed_slice(dtype, want, int(numel))
+
+    def _typed_slice(self, dtype, want: int, numel: int) -> Any:
+        """``numel`` ``dtype`` elements starting at device address ``want``,
+        cut by element index from a typed view of the whole buffer."""
+        itemsize = dtype.itemsize
+        base = self._typed_bases.get(dtype)
+        if base is None:
+            whole = self._flat[: (self._nbytes // itemsize) * itemsize]
+            base = whole.view(dtype)
+            self._typed_bases[dtype] = base
+        delta = want - base.data_ptr()
+        first = delta // itemsize
+        if delta < 0 or delta % itemsize or first + numel > int(base.shape[0]):
+            raise ValueError(
+                f"cudnn: {self._owner} cannot carve {numel} x {dtype} at byte {want - self._flat.data_ptr()}: "
+                "view(dtype) moved the chunk and the whole-buffer view cannot reach it (is the workspace itself a sliced view?)"
+            )
+        out = base[first : first + numel]
+        if out.data_ptr() != want:
+            raise ValueError(f"cudnn: {self._owner} typed workspace chunk landed at 0x{out.data_ptr():x}, expected 0x{want:x}")
+        return out
 
     def remaining(self) -> Any:
         """The unconsumed tail (uint8) — handed down to a nested carver."""

@@ -30,3 +30,24 @@ def test_workspace_carver_rejects_strided_and_misaligned_buffers():
     carver.take(64, torch.int64)
     carver.take(100, torch.float32)
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+
+
+@pytest.mark.L0
+def test_workspace_carver_typed_chunks_land_at_their_byte_offsets():
+    """Every chunk starts exactly where the running offset says, whatever its dtype, and writing
+    one chunk never touches another. Under Paddle ``buf[a:b].view(dtype)`` rescales the byte
+    offset by the itemsize, which used to make the second and later typed chunks alias the first."""
+    base = torch.zeros(1 << 16, dtype=torch.uint8, device="cuda")
+    carver = WorkspaceCarver(base, 1 << 16, "probe")
+    plan = [(2, torch.int32), (1000, torch.float32), (7, torch.int32), (3, torch.float32), (64, torch.int64), (5, torch.uint8)]
+    chunks, offset = [], 0
+    for numel, dtype in plan:
+        chunk = carver.take(numel, dtype)
+        assert chunk.dtype == dtype and chunk.numel() == numel
+        assert chunk.data_ptr() - base.data_ptr() == offset, (numel, dtype)
+        chunks.append(chunk)
+        offset += -(-numel * dtype.itemsize // _WS_ALIGN) * _WS_ALIGN
+    for i, chunk in enumerate(chunks):
+        chunk.fill_(i + 1)
+    for i, chunk in enumerate(chunks):
+        assert bool((chunk == i + 1).all()), f"chunk {i} was overwritten by a later one"
