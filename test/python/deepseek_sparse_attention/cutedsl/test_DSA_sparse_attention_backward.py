@@ -405,10 +405,72 @@ def test_DSA_sparse_attention_backward_qcluster_public_contract():
     assert "deterministic_dkv_relay_cluster_size" not in wrapper
     assert "deterministic_dkv_relay_cluster_size" not in plan
     assert "q_cluster_shared_topk" not in wrapper
+    assert wrapper["sort_topk"].default is False
+    assert "sort_topk" not in plan
 
     dummy = torch.empty(1)
     with pytest.raises(ValueError, match="q_cluster_mode must be 'off' or 'adaptive_pair'"):
         DSA.sparse_attention_backward_wrapper(dummy, dummy, dummy, dummy, dummy, dummy, dummy, q_cluster_mode="fixed")
+
+
+def _sorted_topk_reference(idx, length):
+    """Rows sorted ascending, negative and past-length slots last as -1 (the wrapper's sort_topk contract)."""
+    rows = []
+    for r, row in enumerate(idx.tolist()):
+        n = len(row) if length is None else max(0, min(int(length[r]), len(row)))
+        keep = sorted(v for v in row[:n] if v >= 0)
+        rows.append(keep + [-1] * (len(row) - len(keep)))
+    return torch.tensor(rows, dtype=torch.int32, device=idx.device)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("topk", [1, 3, 64, 100, 129, 2048, 2049, 2176])
+@pytest.mark.parametrize("with_lengths", [False, True], ids=["full", "lengths"])
+def test_DSA_sparse_attention_backward_topk_row_sort_kernel(topk, with_lengths):
+    """The on-device row sort equals a host sort for any width, duplicates, -1 slots and topk_length."""
+    _require_sm100()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward._topk_sort_sm100 import compiled_topk_row_sort
+    from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream
+
+    torch.manual_seed(topk)
+    rows = 37
+    idx = torch.randint(-1, 4 * topk + 8, (rows, topk), dtype=torch.int32, device="cuda")
+    if topk >= 8:
+        idx[:, -4:] = idx[:, :4]  # duplicates
+    length = torch.randint(-2, topk + 3, (rows,), dtype=torch.int32, device="cuda") if with_lengths else None
+    out = torch.empty_like(idx)
+    compiled_topk_row_sort(topk, with_lengths)(idx, out, length, resolve_stream(None))
+    torch.cuda.synchronize()
+    assert torch.equal(out, _sorted_topk_reference(idx, length))
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("with_lengths", [False, True], ids=["full", "lengths"])
+def test_DSA_sparse_attention_backward_sort_topk_matches_caller_sort(with_lengths):
+    """sort_topk=True equals launching on caller-sorted rows bit for bit and leaves the caller's indices untouched."""
+    _require_sm100()
+    from cudnn import DSA
+
+    torch.manual_seed(0)
+    s_q, s_kv, h, d, topk = 64, 4096, 64, 576, 512
+    scale = 1.0 / math.sqrt(d)
+    q = torch.randn(s_q, h, d, dtype=torch.bfloat16, device="cuda") / 10
+    kv = torch.randn(s_kv, d, dtype=torch.bfloat16, device="cuda") / 10
+    sink = torch.randn(h, dtype=torch.float32, device="cuda")
+    idx = torch.stack([torch.randperm(s_kv, device="cuda")[:topk] for _ in range(s_q)]).int()
+    idx[:, ::7] = -1
+    length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device="cuda") if with_lengths else None
+    out, lse = ref_sparse_attention_forward_chunked(q, kv, sink, idx, topk_length=length, softmax_scale=scale)
+    dout = torch.randn_like(out)
+    caller_sorted = _sorted_topk_reference(idx, length)
+    idx_before = idx.clone()
+    args = (q, kv, out, dout, lse, sink)
+    got = DSA.sparse_attention_backward_wrapper(*args, idx, scale, topk_length=length, deterministic=True, sort_topk=True)
+    want = DSA.sparse_attention_backward_wrapper(*args, caller_sorted, scale, topk_length=length, deterministic=True)
+    torch.cuda.synchronize()
+    assert torch.equal(idx, idx_before)
+    for name in ("dq", "dkv", "d_sink"):
+        assert torch.equal(got[name], want[name]), name
 
 
 @pytest.mark.L0
@@ -528,7 +590,7 @@ def test_DSA_sparse_attention_backward_deterministic_compile_cache_is_device_sco
 
     compile_artifact = interface._compile_deterministic_sm100
     compile_artifact.cache_clear()
-    monkeypatch.setattr(interface, "_deterministic_kernel_class_for_config", lambda shards, relay_size: FakeKernel)
+    monkeypatch.setattr(interface, "_deterministic_kernel_class_for_config", lambda shards, relay_size, first_touch=False: FakeKernel)
     monkeypatch.setattr(interface, "_fake_compact_tensor", lambda *args, **kwargs: object())
     monkeypatch.setattr(interface.cute, "sym_int", lambda: object())
     monkeypatch.setattr(interface.cute.runtime, "make_fake_stream", lambda **kwargs: object())
@@ -762,11 +824,12 @@ def test_DSA_sparse_attention_backward_qcluster_graph_replay_switches_overlap_pa
 
 
 @pytest.mark.L0
-def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
+def test_DSA_sparse_attention_backward_deterministic_policy_is_independent(monkeypatch):
     """Keep deterministic scheduling policy separate from ordinary tuning."""
     try:
         import cutlass
 
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import dsa_bwd_sm100_deterministic as det_module
         from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
         from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic import (
             FlashAttentionDSABackwardSm100Deterministic,
@@ -789,6 +852,9 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
+    # The hardware-cluster layout is the policy on devices that cannot
+    # co-schedule the wide cooperative wave; the wide path has its own test.
+    monkeypatch.setattr(det_module, "_current_device_supports_wide_relay", lambda wave_ctas: False)
     assert issubclass(FlashAttentionDSABackwardSm100Deterministic, FlashAttentionDSABackwardSm100)
     assert FlashAttentionDSABackwardSm100Deterministic.num_dkv_shards == 128
     assert FlashAttentionDSABackwardSm100Deterministic.q_wave_ctas == FlashAttentionDSABackwardSm100Deterministic.num_dkv_shards
@@ -925,6 +991,89 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
 
 
 @pytest.mark.L0
+def test_DSA_sparse_attention_backward_deterministic_wide_relay_policy(monkeypatch):
+    """Automatic cluster-4 plans widen to a cooperative 144-CTA wave when it fits."""
+    try:
+        import cutlass
+
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import dsa_bwd_sm100_deterministic as det_module
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    cluster4 = det_module.FlashAttentionDSABackwardSm100DeterministicCluster4
+    wide = det_module.FlashAttentionDSABackwardSm100DeterministicCluster4Wide
+    assert issubclass(wide, cluster4)
+    assert wide.q_wave_ctas == 144
+    assert wide.num_dkv_shards == 36
+    assert wide.dkv_relay_cluster_size == 4
+    assert wide.dkv_mask_rows_per_word == 8
+    assert wide.dkv_cooperative_relay and not cluster4.dkv_cooperative_relay
+    assert wide.num_dkv_final_terms == wide.num_dkv_shards
+    assert not wide.run_dkv_prefold
+    dkv_shape = wide._get_workspace_size_dKV_for_q(16384, 278528, 576, 64, 1, cutlass.Float32)
+    assert math.prod(dkv_shape) == det_module._relay_workspace_bytes(16384, 278528, 576, 64, 4, wide.q_wave_ctas)
+
+    first_touch = det_module.FlashAttentionDSABackwardSm100DeterministicCluster4WideFirstTouch
+    assert issubclass(first_touch, wide)
+    assert first_touch.dkv_first_touch_store and not wide.dkv_first_touch_store and not cluster4.dkv_first_touch_store
+    assert first_touch.num_dkv_shards == wide.num_dkv_shards
+    ft_shape = first_touch._get_workspace_size_dKV_for_q(16384, 278528, 576, 64, 1, cutlass.Float32)
+    assert math.prod(ft_shape) == det_module._relay_workspace_bytes(16384, 278528, 576, 64, 4, wide.q_wave_ctas, True)
+    # First-touch adds one owner word per KV row to each plane.
+    assert ft_shape[2] - dkv_shape[2] == math.ceil(278528 / 576)
+
+    # Automatic plans use the single-launch ticket variants of both classes.
+    wide_t = det_module.FlashAttentionDSABackwardSm100DeterministicCluster4WideTicket
+    ft_t = det_module.FlashAttentionDSABackwardSm100DeterministicCluster4WideFirstTouchTicket
+    assert issubclass(wide_t, wide) and issubclass(ft_t, wide_t)
+    assert wide_t.dkv_ticket_relay and ft_t.dkv_ticket_relay and not wide.dkv_ticket_relay
+    assert not wide_t.dkv_cooperative_relay and ft_t.dkv_first_touch_store and not wide_t.dkv_first_touch_store
+    # The ticket relay cycles 40 planes; it needs no co-residency, so 160 may exceed the SM count.
+    assert wide_t.q_wave_ctas == ft_t.q_wave_ctas == 160
+    assert wide_t.num_dkv_shards == ft_t.num_dkv_shards == wide_t.num_dkv_final_terms == 40
+    assert det_module._DETERMINISTIC_WIDE_RELAY_KERNELS[4] is wide_t
+    assert det_module._DETERMINISTIC_FIRST_TOUCH_RELAY_KERNELS[4] is ft_t
+    for cls, ft in ((wide_t, False), (ft_t, True)):
+        shape = cls._get_workspace_size_dKV_for_q(16384, 278528, 576, 64, 1, cutlass.Float32)
+        assert math.prod(shape) == det_module._relay_workspace_bytes(16384, 278528, 576, 64, 4, cls.q_wave_ctas, ft, True)
+    # The ticket counter and per-group finish counts take whole rows of every plane.
+    ticket_bytes = det_module._relay_workspace_bytes(16384, 278528, 576, 64, 4, 160, False, True) - det_module._relay_workspace_bytes(16384, 278528, 576, 64, 4, 160)
+    assert ticket_bytes == 40 * math.ceil((16384 // 4 + 1) / 576) * 576 * 4
+    wide, first_touch = wide_t, ft_t
+
+    monkeypatch.setattr(det_module, "_current_device_supports_wide_relay", lambda wave_ctas: wave_ctas <= 148)
+    # Wide plans with S_kv >= 8 * S_q skip the data-plane clear.
+    assert det_module.deterministic_kernel_class(16384, 278528, 576) is first_touch
+    assert det_module.deterministic_kernel_class(16384, 131072, 576) is first_touch
+    assert det_module.deterministic_kernel_class(16384, 131071, 576) is wide
+    assert det_module.deterministic_kernel_class(8192, 65537, 512) is first_touch
+    assert det_module.deterministic_kernel_class(16384, 65536, 576) is wide
+    # Explicit overrides keep the hardware-cluster layout.
+    assert det_module.deterministic_kernel_class(16384, 278528, 576, deterministic_relay_cluster_size=4) is cluster4
+    # Cluster-8 and cluster-16 plans are unchanged.
+    assert det_module.deterministic_kernel_class(8191, 65537, 512) is det_module.FlashAttentionDSABackwardSm100DeterministicCluster8
+    assert det_module.deterministic_kernel_class(16384, 524288, 576) is det_module.FlashAttentionDSABackwardSm100DeterministicCluster16
+    # At the cluster-4 budget edge the wider plane set no longer fits; keep 32 planes.
+    assert det_module._relay_workspace_bytes(16384, 453432, 576, 64, 4, wide.q_wave_ctas) > det_module._RELAY_WORKSPACE_BUDGET_BYTES
+    assert det_module.deterministic_kernel_class(16384, 453432, 576) is cluster4
+    assert det_module._deterministic_kernel_class_for_config(40, 4) is wide
+    assert det_module._deterministic_kernel_class_for_config(32, 4) is cluster4
+    assert det_module._deterministic_kernel_class_for_config(40, 4, True) is first_touch
+    with pytest.raises(ValueError, match="first-touch"):
+        det_module._deterministic_kernel_class_for_config(32, 4, True)
+    # Long query batches below the 128-shard cap also take the wide relay;
+    # shorter ones keep the bounded-wave shards.
+    assert not det_module.use_cluster_dkv_relay(16384, 16384, 576)
+    assert det_module.deterministic_kernel_class(16384, 16384, 576) is wide
+    assert det_module.deterministic_kernel_class(8192, 4096, 512) is wide
+    assert det_module.deterministic_kernel_class(8191, 16384, 576) is det_module.FlashAttentionDSABackwardSm100Deterministic
+
+    monkeypatch.setattr(det_module, "_current_device_supports_wide_relay", lambda wave_ctas: False)
+    assert det_module.deterministic_kernel_class(16384, 278528, 576) is cluster4
+    assert det_module.deterministic_kernel_class(16384, 16384, 576) is det_module.FlashAttentionDSABackwardSm100Deterministic
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("helper_name", ["_wait_lower_rank_mask", "_wait_lower_rank_mask64"])
 def test_DSA_sparse_attention_backward_relay_acquire_load_controls_exit(helper_name):
     """Keep the GPU acquire load live by feeding its value to loop control."""
@@ -1023,7 +1172,10 @@ def test_DSA_sparse_attention_backward_sm100_large_context_workspace_uses_cluste
     mask_words_per_plane = num_waves * num_head_blocks * (padded_kv // mask_rows_per_word)
     mask_rows_per_plane = math.ceil(mask_words_per_plane / head_dim)
     lse_odo_bytes = num_heads * padded_q * 2 * torch.float32.itemsize
-    dkv_bytes = kernel_cls.num_dkv_shards * (padded_kv + mask_rows_per_plane) * head_dim * torch.float32.itemsize
+    owner_rows_per_plane = math.ceil(padded_kv / head_dim) if kernel_cls.dkv_first_touch_store else 0
+    ticket_words = num_head_blocks * (math.ceil(s_q / kernel_cls.dkv_relay_cluster_size) + 1)
+    ticket_rows_per_plane = math.ceil(ticket_words / head_dim) if getattr(kernel_cls, "dkv_ticket_relay", False) else 0
+    dkv_bytes = kernel_cls.num_dkv_shards * (padded_kv + mask_rows_per_plane + owner_rows_per_plane + ticket_rows_per_plane) * head_dim * torch.float32.itemsize
     assert interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64") == lse_odo_bytes + dkv_bytes
 
 

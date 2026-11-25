@@ -337,12 +337,13 @@ def _compile_deterministic_sm100(
     deterministic_shards: int,
     deterministic_relay_cluster_size: int,
     wide_addressing: bool = False,
+    dkv_first_touch: bool = False,
 ):
     """Compile one device-owned, shape-dynamic artifact from plan metadata.
 
     Query and KV extents remain symbolic, while dtype, head geometry, top-k
-    width, optional-length presence, plane count, relay width, and address
-    width are compile-time facts.
+    width, optional-length presence, plane count, relay width, first-touch
+    dKV stores, and address width are compile-time facts.
     The returned launchable belongs to ``device_index``'s CUDA context and may
     be reused only for plans with the same cached signature.
     """
@@ -352,7 +353,7 @@ def _compile_deterministic_sm100(
         raise ValueError(f"unsupported deterministic SM100 dtype {dtype}")
 
     if backend == "generic_m64":
-        kernel_cls = _deterministic_kernel_class_for_config(deterministic_shards, deterministic_relay_cluster_size)
+        kernel_cls = _deterministic_kernel_class_for_config(deterministic_shards, deterministic_relay_cluster_size, dkv_first_touch)
     else:
         kernel_cls = _get_sm100_kernel_class(backend, True)
         required_shards = kernel_cls.num_dkv_shards
@@ -595,6 +596,7 @@ def flash_attn_bwd_sm100(
         )
     deterministic_shards = kernel_cls.num_dkv_shards if deterministic else 0
     selected_relay_cluster_size = getattr(kernel_cls, "dkv_relay_cluster_size", 1) if deterministic else 0
+    selected_first_touch = bool(getattr(kernel_cls, "dkv_first_touch_store", False)) if deterministic else False
     uses_h128_two_cta = backend == "h128_2cta_m64"
     batch_size = 1
 
@@ -646,6 +648,7 @@ def flash_attn_bwd_sm100(
         block_tile,
         deterministic_shards,
         selected_relay_cluster_size,
+        selected_first_touch,
         device.index,
         max_topk,
         has_topk_length,

@@ -50,6 +50,21 @@ class FlashAttentionDSABackwardSm100:
     dkv_cluster_shape = (1, 1, 1)
     dkv_relay_cluster_size = 1
     dkv_relay_phases = 1
+    # Co-schedule relay ranks with a cooperative launch of single-CTA clusters
+    # instead of hardware clusters. A relay group no longer has to fit one GPC,
+    # so a wave can cover every SM rather than the GPC-packable cluster count.
+    dkv_cooperative_relay = False
+    # The first update of each accumulator row stores instead of adding, so
+    # the data rows need no clearing pass. The policy supplies
+    # dKV_first_touch_owner_words()/dKV_first_touch_flag() and must leave
+    # untouched rows out of its fold.
+    dkv_first_touch_store = False
+    # Launch every query CTA at once and let each CTA take its token from a
+    # ticket counter, so tokens start in ticket order and a CTA only ever waits
+    # on lower tickets. The policy supplies dKV_take_ticket(),
+    # dKV_wait_ticket_window() and dKV_finish_ticket(), and its acquire must
+    # also order a row after the previous wave.
+    dkv_ticket_relay = False
 
     def __init__(
         self,
@@ -628,6 +643,7 @@ class FlashAttentionDSABackwardSm100:
             compute_mma_dS_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.compute_mma_dS_stage * 2]
             mma_reduce_dKV_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_reduce_dKV_stage * 2]
             tmem_holding_buf: cutlass.Int32
+            ticket_buf: cutlass.Int32
             sQ: cute.struct.Align[
                 cute.struct.MemRange[self.element_dtype, cute.cosize(Q_smem_layout_staged)],
                 self.buffer_align_bytes,
@@ -700,10 +716,14 @@ class FlashAttentionDSABackwardSm100:
             return
 
         num_head_blocks = cute.ceil_div(bwd_problem_shape[3][0], self.block_tile)
-        q_wave_size = self.q_wave_ctas if cutlass.const_expr(self.q_wave_ctas > 0) else problem_shape[0]
+        q_wave_size = self.q_wave_ctas if cutlass.const_expr(self.q_wave_ctas > 0 and not self.dkv_ticket_relay) else problem_shape[0]
         if cutlass.const_expr(self.q_wave_ctas > 0):
             assert self.q_wave_ctas % self.dkv_relay_phases == 0
-            assert self.dkv_relay_cluster_size == self.dkv_cluster_shape[0] * self.dkv_relay_phases
+            if cutlass.const_expr(self.dkv_cooperative_relay or self.dkv_ticket_relay):
+                assert not (self.dkv_cooperative_relay and self.dkv_ticket_relay)
+                assert self.dkv_relay_phases == 1 and self.q_wave_ctas % self.dkv_relay_cluster_size == 0
+            else:
+                assert self.dkv_relay_cluster_size == self.dkv_cluster_shape[0] * self.dkv_relay_phases
         q_launch_size = q_wave_size // self.dkv_relay_phases
         if cutlass.const_expr(self.serialize_head_blocks):
             num_head_block_phases = num_head_blocks
@@ -765,10 +785,11 @@ class FlashAttentionDSABackwardSm100:
                     ).launch(
                         grid=(q_launch_size, head_blocks_per_launch, bwd_problem_shape[3][1]),
                         block=[self.threads_per_cta, 1, 1],
-                        cluster=self.dkv_cluster_shape,
+                        cluster=(1, 1, 1) if cutlass.const_expr(self.dkv_cooperative_relay or self.dkv_ticket_relay) else self.dkv_cluster_shape,
                         smem=self.shared_storage.size_in_bytes(),
                         stream=stream,
                         min_blocks_per_mp=1,
+                        cooperative=self.dkv_cooperative_relay,
                     )
 
         if cutlass.const_expr(self.finalize_dkv):
@@ -979,7 +1000,9 @@ class FlashAttentionDSABackwardSm100:
         token_idx = wave_idx
         if cutlass.const_expr(self.serialize_head_blocks):
             head_block_idx += head_block_offset
-        if cutlass.const_expr(self.q_wave_ctas > 0):
+        if cutlass.const_expr(self.q_wave_ctas > 0 and (self.dkv_cooperative_relay or self.dkv_ticket_relay)):
+            token_idx = q_offset + wave_idx
+        elif cutlass.const_expr(self.q_wave_ctas > 0):
             physical_cluster_size = self.dkv_cluster_shape[0]
             logical_group_idx = wave_idx // physical_cluster_size
             physical_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -988,6 +1011,16 @@ class FlashAttentionDSABackwardSm100:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         max_seqlen_q, max_seqlen_kv, head_dim, (num_heads, batch_size) = problem_shape
+
+        if cutlass.const_expr(self.dkv_ticket_relay):
+            # Tickets follow CTA start order, so every lower ticket is already
+            # running and a CTA's waits on lower tokens always make progress.
+            storage = SmemAllocator().allocate(self.shared_storage)
+            sTicket = cute.make_tensor(storage.ticket_buf.ptr, cute.make_layout(1))
+            if tidx == 0:
+                sTicket[0] = self.dKV_take_ticket(mdKV_acc, problem_shape, head_block_idx)
+            cute.arch.barrier()
+            token_idx = cute.arch.make_warp_uniform(sTicket[0])
 
         # Only deterministic waves pad the last launch. Compile this guard out
         # of the ordinary single-launch kernel, where every token is in range.
@@ -1014,6 +1047,11 @@ class FlashAttentionDSABackwardSm100:
                     head_idx = head_block_idx * self.block_tile + head_offset
                     if head_idx < num_heads:
                         mdQ[dim_idx, head_idx, (token_idx, batch_idx)] = mdQ.element_type(0.0)
+            if cutlass.const_expr(self.dkv_ticket_relay):
+                # An empty token still passes on the previous wave's ordering.
+                if tidx == 0:
+                    self.dKV_wait_ticket_window(mdKV_acc, problem_shape, token_idx, head_block_idx)
+                    self.dKV_finish_ticket(mdKV_acc, problem_shape, token_idx, head_block_idx)
             cute.arch.nvvm.exit()
 
         if warp_idx == self.load_warp_id:
@@ -1021,8 +1059,8 @@ class FlashAttentionDSABackwardSm100:
             cpasync.prefetch_descriptor(tma_atom_dO)
             cpasync.prefetch_descriptor(tma_atom_dQ)
 
-        smem = SmemAllocator()
-        storage = smem.allocate(self.shared_storage)
+        if cutlass.const_expr(not self.dkv_ticket_relay):
+            storage = SmemAllocator().allocate(self.shared_storage)
 
         load_mma_QdO_pipeline = self.make_and_init_load_mma_QdO_pipeline(
             storage.load_mma_QdO_mbar_ptr.data_ptr(),
@@ -1292,6 +1330,12 @@ class FlashAttentionDSABackwardSm100:
                 QK_tiled_mma, dOV_tiled_mma, QdS_tiled_mma, KdS_tiled_mma, dKV4_tiled_mma, dQ4_tiled_mma, tmem_ptr_base
             )
 
+            reduce_tidx0 = self.reduce_warp_id[0] * self.threads_per_warp
+            if cutlass.const_expr(self.dkv_ticket_relay):
+                # Order this token's plane rows after the previous wave's.
+                if tidx == reduce_tidx0:
+                    self.dKV_wait_ticket_window(mdKV_acc, problem_shape, token_idx, head_block_idx)
+                _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
             self.reduce_dKV(
                 (tdKVtdKV0, tdKVtdKV1, tdKVtdKV2, tdKVtdKV3, tdKVtdKV4),
                 mdKV_acc,
@@ -1304,6 +1348,10 @@ class FlashAttentionDSABackwardSm100:
                 problem_shape,
                 mma_reduce_dKV_pipeline,
             )
+            if cutlass.const_expr(self.dkv_ticket_relay):
+                _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
+                if tidx == reduce_tidx0:
+                    self.dKV_finish_ticket(mdKV_acc, problem_shape, token_idx, head_block_idx)
             # All T2R reads issued by this warp are complete here (each T2R
             # generation fences before its pipeline release);
             # signal compute warp 0 that TMEM dealloc is now safe.
@@ -2422,6 +2470,11 @@ class FlashAttentionDSABackwardSm100:
 
         tile_index = tile_count - 1
         rTopkIdx = cute.make_rmem_tensor((8,), cutlass.Int32)
+        rFirst, owner_words, owner_code = None, None, None
+        if cutlass.const_expr(self.dkv_first_touch_store):
+            rFirst = cute.make_rmem_tensor((8,), cutlass.Int32)
+            owner_words = self.dKV_first_touch_owner_words(mdKV_acc_full, max_seqlen_kv, token_idx)
+            owner_code = self._owner_code(token_idx)
         full_tiles = (topk % self.block_tile) == 0
         while tile_index >= 0:
             # Preload the indices shared by every dKV fragment.
@@ -2438,6 +2491,9 @@ class FlashAttentionDSABackwardSm100:
                         rTopkIdx[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
                     else:
                         rTopkIdx[i] = Int32(-1)
+            if cutlass.const_expr(self.dkv_first_touch_store):
+                for i in cutlass.range_constexpr(8):
+                    rFirst[i] = self.dKV_first_touch_flag(owner_words, owner_code, head_block_idx, rTopkIdx[i])
 
             self.acquire_dKV_tile_relay(
                 mdKV_acc_full,
@@ -2460,8 +2516,8 @@ class FlashAttentionDSABackwardSm100:
             _partial_cta_sync(self.t2r_dKV01_done_barrier.barrier_id, self.t2r_dKV01_done_barrier.num_threads)
 
             if cutlass.const_expr(self.same_hdim_kv):
-                self.reduce_dKV_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
-                self.reduce_dKV_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0, rFirst)
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1, rFirst)
 
             # Advance to dKV4 (D576) or dKV2/3 (D512).
             mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
@@ -2483,7 +2539,7 @@ class FlashAttentionDSABackwardSm100:
                 # The 128-wide and 64-wide T2R layouts share the same KV-row
                 # coordinate (N=block_tile), so reuse the preloaded indices.
                 # Issue dKV0, dKV1, then the short tail for each KV row.
-                self.reduce_dKV_0_tail_1_from_reg(mdKV_acc, rdKV0, rdKV4, rdKV1, rTopkIdx)
+                self.reduce_dKV_0_tail_1_from_reg(mdKV_acc, rdKV0, rdKV4, rdKV1, rTopkIdx, rFirst)
 
             mma_reduce_dKV_pipeline.consumer_wait(mma_reduce_dKV_consumer_state)
 
@@ -2507,12 +2563,12 @@ class FlashAttentionDSABackwardSm100:
                 _partial_cta_sync(self.t2r_dKV23_done_barrier.barrier_id, self.t2r_dKV23_done_barrier.num_threads)
 
             if cutlass.const_expr(self.same_hdim_kv):
-                self.reduce_dKV_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
-                self.reduce_dKV_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2, rFirst)
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3, rFirst)
             else:
                 mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
                 mma_reduce_dKV_consumer_state.advance()
-                self.reduce_dKV_pair_from_reg(mdKV_acc, rdKV2, rdKV3, rTopkIdx, 2, 3)
+                self.reduce_dKV_pair_from_reg(mdKV_acc, rdKV2, rdKV3, rTopkIdx, 2, 3, rFirst)
 
             if cutlass.const_expr(self.same_hdim_kv):
                 mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
@@ -2564,6 +2620,7 @@ class FlashAttentionDSABackwardSm100:
         tTR_rdKV: cute.Tensor,
         rTopkIdx: cute.Tensor,
         sub_tile_idx: int,
+        rFirst: Optional[cute.Tensor] = None,
     ):
         """Reduce dKV from registers to global memory via atomic_add."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -2587,7 +2644,13 @@ class FlashAttentionDSABackwardSm100:
                 tile_dKV_row = tile_dKV_row[None, sub_tile_idx]
                 tile_dKV_row = cute.flat_divide(tile_dKV_row, (4,))  # (4, 32)
                 cur_dKV_frg = tile_dKV_row[None, dp_idx // 4]
-                cute.arch.atomic_add(cur_dKV_frg.iterator.llvm_ptr, rdKV_frg.load())
+                if cutlass.const_expr(rFirst is not None):
+                    if rFirst[i] != 0:
+                        cute.arch.store(cur_dKV_frg.iterator.llvm_ptr, rdKV_frg.load())
+                    else:
+                        cute.arch.atomic_add(cur_dKV_frg.iterator.llvm_ptr, rdKV_frg.load())
+                else:
+                    cute.arch.atomic_add(cur_dKV_frg.iterator.llvm_ptr, rdKV_frg.load())
 
         if cutlass.const_expr(self.same_hdim_kv):
             _partial_cta_sync(self.reduce_sync_barrier.barrier_id, self.reduce_sync_barrier.num_threads)
@@ -2601,6 +2664,7 @@ class FlashAttentionDSABackwardSm100:
         rTopkIdx: cute.Tensor,
         sub_tile_idx0: int,
         sub_tile_idx1: int,
+        rFirst: Optional[cute.Tensor] = None,
     ):
         """Reduce two resident 128-wide fragments with one index/address loop."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -2630,8 +2694,16 @@ class FlashAttentionDSABackwardSm100:
                 lane_offset = (dp_idx // 4) * 4
                 ptr0 = row_ptr + sub_tile_idx0 * 128 + lane_offset
                 ptr1 = row_ptr + sub_tile_idx1 * 128 + lane_offset
-                cute.arch.atomic_add(ptr0.llvm_ptr, rdKV_frg0.load())
-                cute.arch.atomic_add(ptr1.llvm_ptr, rdKV_frg1.load())
+                if cutlass.const_expr(rFirst is not None):
+                    if rFirst[i] != 0:
+                        cute.arch.store(ptr0.llvm_ptr, rdKV_frg0.load())
+                        cute.arch.store(ptr1.llvm_ptr, rdKV_frg1.load())
+                    else:
+                        cute.arch.atomic_add(ptr0.llvm_ptr, rdKV_frg0.load())
+                        cute.arch.atomic_add(ptr1.llvm_ptr, rdKV_frg1.load())
+                else:
+                    cute.arch.atomic_add(ptr0.llvm_ptr, rdKV_frg0.load())
+                    cute.arch.atomic_add(ptr1.llvm_ptr, rdKV_frg1.load())
 
     @cute.jit
     def reduce_dKV_0_tail_1_from_reg(
@@ -2641,6 +2713,7 @@ class FlashAttentionDSABackwardSm100:
         tTR_rdKV4: cute.Tensor,
         tTR_rdKV1: cute.Tensor,
         rTopkIdx: cute.Tensor,
+        rFirst: Optional[cute.Tensor] = None,
     ):
         """Reduce resident dKV0/dKV1/tail fragments, preparing one KV row before REDG."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -2669,9 +2742,19 @@ class FlashAttentionDSABackwardSm100:
             topk0 = rTopkIdx[i0]
             if topk0 >= 0:
                 row0 = dKV_acc.iterator + Int64(topk0) * Int64(self.head_dim)
-                cute.arch.atomic_add((row0 + lane_offset4).llvm_ptr, frg00.load())
-                cute.arch.atomic_add((row0 + 128 + lane_offset4).llvm_ptr, frg10.load())
-                cute.arch.atomic_add((row0 + self.head_dim_main + lane_offset2).llvm_ptr, frg40.load())
+                if cutlass.const_expr(rFirst is not None):
+                    if rFirst[i0] != 0:
+                        cute.arch.store((row0 + lane_offset4).llvm_ptr, frg00.load())
+                        cute.arch.store((row0 + 128 + lane_offset4).llvm_ptr, frg10.load())
+                        cute.arch.store((row0 + self.head_dim_main + lane_offset2).llvm_ptr, frg40.load())
+                    else:
+                        cute.arch.atomic_add((row0 + lane_offset4).llvm_ptr, frg00.load())
+                        cute.arch.atomic_add((row0 + 128 + lane_offset4).llvm_ptr, frg10.load())
+                        cute.arch.atomic_add((row0 + self.head_dim_main + lane_offset2).llvm_ptr, frg40.load())
+                else:
+                    cute.arch.atomic_add((row0 + lane_offset4).llvm_ptr, frg00.load())
+                    cute.arch.atomic_add((row0 + 128 + lane_offset4).llvm_ptr, frg10.load())
+                    cute.arch.atomic_add((row0 + self.head_dim_main + lane_offset2).llvm_ptr, frg40.load())
 
     @cute.jit
     def t2r_dKV_64(self, tdKVtdKV: cute.Tensor):
