@@ -405,10 +405,72 @@ def test_DSA_sparse_attention_backward_qcluster_public_contract():
     assert "deterministic_dkv_relay_cluster_size" not in wrapper
     assert "deterministic_dkv_relay_cluster_size" not in plan
     assert "q_cluster_shared_topk" not in wrapper
+    assert wrapper["sort_topk"].default is False
+    assert "sort_topk" not in plan
 
     dummy = torch.empty(1)
     with pytest.raises(ValueError, match="q_cluster_mode must be 'off' or 'adaptive_pair'"):
         DSA.sparse_attention_backward_wrapper(dummy, dummy, dummy, dummy, dummy, dummy, dummy, q_cluster_mode="fixed")
+
+
+def _sorted_topk_reference(idx, length):
+    """Rows sorted ascending, negative and past-length slots last as -1 (the wrapper's sort_topk contract)."""
+    rows = []
+    for r, row in enumerate(idx.tolist()):
+        n = len(row) if length is None else max(0, min(int(length[r]), len(row)))
+        keep = sorted(v for v in row[:n] if v >= 0)
+        rows.append(keep + [-1] * (len(row) - len(keep)))
+    return torch.tensor(rows, dtype=torch.int32, device=idx.device)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("topk", [1, 3, 64, 100, 129, 2048, 2049, 2176])
+@pytest.mark.parametrize("with_lengths", [False, True], ids=["full", "lengths"])
+def test_DSA_sparse_attention_backward_topk_row_sort_kernel(topk, with_lengths):
+    """The on-device row sort equals a host sort for any width, duplicates, -1 slots and topk_length."""
+    _require_sm100()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward._topk_sort_sm100 import compiled_topk_row_sort
+    from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream
+
+    torch.manual_seed(topk)
+    rows = 37
+    idx = torch.randint(-1, 4 * topk + 8, (rows, topk), dtype=torch.int32, device="cuda")
+    if topk >= 8:
+        idx[:, -4:] = idx[:, :4]  # duplicates
+    length = torch.randint(-2, topk + 3, (rows,), dtype=torch.int32, device="cuda") if with_lengths else None
+    out = torch.empty_like(idx)
+    compiled_topk_row_sort(topk, with_lengths)(idx, out, length, resolve_stream(None))
+    torch.cuda.synchronize()
+    assert torch.equal(out, _sorted_topk_reference(idx, length))
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("with_lengths", [False, True], ids=["full", "lengths"])
+def test_DSA_sparse_attention_backward_sort_topk_matches_caller_sort(with_lengths):
+    """sort_topk=True equals launching on caller-sorted rows bit for bit and leaves the caller's indices untouched."""
+    _require_sm100()
+    from cudnn import DSA
+
+    torch.manual_seed(0)
+    s_q, s_kv, h, d, topk = 64, 4096, 64, 576, 512
+    scale = 1.0 / math.sqrt(d)
+    q = torch.randn(s_q, h, d, dtype=torch.bfloat16, device="cuda") / 10
+    kv = torch.randn(s_kv, d, dtype=torch.bfloat16, device="cuda") / 10
+    sink = torch.randn(h, dtype=torch.float32, device="cuda")
+    idx = torch.stack([torch.randperm(s_kv, device="cuda")[:topk] for _ in range(s_q)]).int()
+    idx[:, ::7] = -1
+    length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device="cuda") if with_lengths else None
+    out, lse = ref_sparse_attention_forward_chunked(q, kv, sink, idx, topk_length=length, softmax_scale=scale)
+    dout = torch.randn_like(out)
+    caller_sorted = _sorted_topk_reference(idx, length)
+    idx_before = idx.clone()
+    args = (q, kv, out, dout, lse, sink)
+    got = DSA.sparse_attention_backward_wrapper(*args, idx, scale, topk_length=length, deterministic=True, sort_topk=True)
+    want = DSA.sparse_attention_backward_wrapper(*args, caller_sorted, scale, topk_length=length, deterministic=True)
+    torch.cuda.synchronize()
+    assert torch.equal(idx, idx_before)
+    for name in ("dq", "dkv", "d_sink"):
+        assert torch.equal(got[name], want[name]), name
 
 
 @pytest.mark.L0

@@ -32,6 +32,7 @@ from ._sm90_relay import (
     sm90_deterministic_relay_requirement_error,
 )
 from ._qcluster_sm100 import compile_plan, workspace_size
+from ._topk_sort_sm100 import compiled_topk_row_sort
 
 
 def _checked_deterministic_relay_cluster_size(value: Optional[int]) -> Optional[int]:
@@ -614,6 +615,7 @@ def sparse_attention_backward_wrapper(
     workspace: Optional[torch.Tensor] = None,
     q_cluster_mode: str = "off",
     deterministic_relay_cluster_size: Optional[int] = None,
+    sort_topk: bool = False,
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'dq', 'dkv', 'd_sink'}``.
 
@@ -643,6 +645,13 @@ def sparse_attention_backward_wrapper(
     clusters. ``None`` selects C16 on SM90 and the automatic policy on SM100.
     This plan-time choice changes the required workspace and remains fixed
     across every execution and CUDA Graph replay of the cached plan.
+
+    ``sort_topk=True`` launches on an ascending copy of every int32 top-k row,
+    sorted on the launch stream by a one-CTA-per-row shared-memory kernel.
+    Negative slots (and, with ``topk_length``, every slot past the row length)
+    become -1 at the row tail, the same rows as sorting with -1 mapped to
+    INT32_MAX. Deterministic relay ranks then reach shared KV rows in the same
+    order and wait far less; only the FP32 accumulation order of dq changes.
     """
     deterministic_relay_cluster_size = _checked_deterministic_relay_cluster_size(deterministic_relay_cluster_size)
     if deterministic_relay_cluster_size is not None and not deterministic:
@@ -659,6 +668,14 @@ def sparse_attention_backward_wrapper(
     q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length = (
         contiguous_on_stream(t, launch_stream, q.device) for t in (q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length)
     )
+    if sort_topk:
+        if topk_idxs.dtype != torch.int32 or topk_idxs.dim() != 2:
+            raise ValueError(f"sort_topk requires a 2-D int32 topk_idxs, got {topk_idxs.dtype} with {topk_idxs.dim()} dims")
+        with torch.cuda.device(q.device), torch_stream_context(launch_stream):
+            sorted_idxs = torch.empty_like(topk_idxs)
+        if topk_idxs.shape[0] > 0:
+            compiled_topk_row_sort(int(topk_idxs.shape[1]), topk_length is not None)(topk_idxs, sorted_idxs, topk_length, launch_stream)
+        topk_idxs = sorted_idxs
     key = (
         q.device,
         q.dtype,
